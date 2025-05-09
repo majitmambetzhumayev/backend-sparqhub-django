@@ -1,10 +1,14 @@
+#assistants/views.py
 import logging
 from rest_framework import viewsets, status
 from rest_framework.response import Response
+from users.authentication import CookieJWTAuthentication
 from rest_framework.permissions import IsAuthenticated
 from .models import Assistant
 from .serializers import AssistantSerializer
 from ai_providers.factory import get_provider  # Returns the provider integration instance
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_protect
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +18,9 @@ class AssistantViewSet(viewsets.ModelViewSet):
     - For remote-persistent providers, creation and update must sync with the provider.
     - Soft delete is implemented locally (and optionally, remote deletion if supported).
     """
+    authentication_classes = [CookieJWTAuthentication]
     permission_classes = [IsAuthenticated]
+    # permission_classes = [AllowAny]
     serializer_class = AssistantSerializer
     
 

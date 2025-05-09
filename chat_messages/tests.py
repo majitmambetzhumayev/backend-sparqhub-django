@@ -1,7 +1,7 @@
 # chat_messages/tests.py
 from django.test import TestCase
 from agents import Agent, Runner
-from ai_providers.openai.chat_api import chat_with_agent
+from backend_sparqhub.ai_providers.openai.async_chat import chat_with_agent
 from assistants.models import Assistant
 from django.contrib.auth import get_user_model
 

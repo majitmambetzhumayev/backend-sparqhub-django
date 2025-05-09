@@ -1,17 +1,21 @@
-# ai_providers/openai/interface.py
 import logging
 from ai_providers.base import AIProviderBase
 from .assistant_api import create_agent_and_record, soft_delete_local
-from .chat_api import chat_with_agent
+from .async_chat import chat_async
+from .streaming_chat import stream_chat
 from .sdk_utils import apply_openai_key
 
 logger = logging.getLogger(__name__)
 
 class OpenAIAssistantInterface(AIProviderBase):
-    # Set supports_crud to True so our view uses our create/update methods.
+    """
+    Adapter for the OpenAI Agents SDK.
+    """
+
     supports_crud = True
 
     def __init__(self, user=None):
+        # Ensure environment is set before any SDK usage
         apply_openai_key(user)
 
     def create_assistant(self, user, name, instructions, model="gpt-4o"):
@@ -22,8 +26,9 @@ class OpenAIAssistantInterface(AIProviderBase):
         try:
             assistant = Assistant.objects.get(provider_assistant_id=assistant_id, user=user)
         except Assistant.DoesNotExist:
-            logger.error("Assistant with ID %s not found for user %s", assistant_id, user)
-            raise Exception("Assistant not found")
+            logger.error("Assistant not found: %s", assistant_id)
+            raise
+
         if name:
             assistant.name = name
         if instructions:
@@ -37,4 +42,9 @@ class OpenAIAssistantInterface(AIProviderBase):
         return soft_delete_local(assistant_id, user)
 
     def chat(self, assistant, message_text, stream=False):
-        return chat_with_agent(assistant, message_text, stream)
+        if stream:
+            # return async generator directly
+            return stream_chat(assistant, message_text)
+        else:
+            # return an awaitable that your Celery task can call
+            return chat_async(assistant, message_text)

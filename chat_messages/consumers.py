@@ -1,33 +1,55 @@
+# chat_messages/consumers.py
 import json
 from channels.generic.websocket import AsyncWebsocketConsumer
+from asgiref.sync import sync_to_async
+from ai_providers.chat_router import send_chat_message  # must support async streaming
+from threads.models    import Thread
+from chat_messages.models import Message
 
-class ChatConsumer(AsyncWebsocketConsumer):
+class QuickChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        self.thread_id = self.scope['url_route']['kwargs']['thread_id']
-        self.group_name = f"chat_{self.thread_id}"
-        # Join room group
-        await self.channel_layer.group_add(self.group_name, self.channel_name)
+        # Accept connection
         await self.accept()
 
-    async def disconnect(self, close_code):
-        # Leave the group on disconnect
-        await self.channel_layer.group_discard(self.group_name, self.channel_name)
-
     async def receive(self, text_data):
+        """
+        Expects JSON: {"assistant_id": int, "thread_id": int|null, "message": str}
+        Streams back each token as: {"chunk": "..."}
+        """
         data = json.loads(text_data)
-        message = data.get('message', '')
-        # Optionally, process the message and then broadcast to the group
-        await self.channel_layer.group_send(
-            self.group_name,
-            {
-                "type": "chat_message",
-                "message": message,
-            }
+        assistant_id = data.get("assistant_id")
+        thread_id    = data.get("thread_id")
+        message_text = data.get("message")
+
+        if not assistant_id or not message_text:
+            await self.send(json.dumps({"error":"Missing fields"}))
+            return
+
+        # 1) Fetch/create thread synchronously
+        if thread_id is None:
+            thread = await sync_to_async(Thread.objects.create)(
+                user=self.scope["user"], assistant_id=assistant_id
+            )
+        else:
+            thread = await sync_to_async(Thread.objects.get)(
+                pk=thread_id, user=self.scope["user"]
+            )
+
+        # 2) Save user message
+        await sync_to_async(Message.objects.create)(
+            thread=thread, sender="user", content=message_text
         )
 
-    async def chat_message(self, event):
-        # Send the message back to WebSocket client
-        message = event.get("message")
-        await self.send(text_data=json.dumps({
-            "message": message,
-        }))
+        # 3) Stream AI response
+        async for chunk in send_chat_message(
+            thread.assistant, message_text, stream=True
+        ):
+            # Send each token/chunk immediately
+            await self.send(json.dumps({"chunk": chunk}))
+
+        # 4) Save the full assistant reply
+        full_reply = ""  # accumulate if desired
+        # (you might collect chunks into full_reply here)
+        await sync_to_async(Message.objects.create)(
+            thread=thread, sender="assistant", content=full_reply
+        )

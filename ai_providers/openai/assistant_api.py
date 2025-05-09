@@ -1,46 +1,74 @@
-# ai_providers/openai/assistant_api.py
 import logging
 import uuid
-from agents import Agent
+import os
+from agents import Agent, Runner, input_guardrail, GuardrailFunctionOutput
+from pydantic import BaseModel
 from assistants.models import Assistant
+from .sdk_utils import apply_openai_key
 
 logger = logging.getLogger(__name__)
 
+class UserInput(BaseModel):
+    instructions: str
+    model: str = "gpt-4o"
+    
+@input_guardrail()
+def validate_user_input(ctx, item) -> GuardrailFunctionOutput:
+    # pydantic validation will raise if it fails
+    validated = UserInput.parse_obj(item)
+    return GuardrailFunctionOutput(input=validated.dict())    
+
 def create_agent_and_record(user, name, instructions, model="gpt-4o"):
     """
-    Creates an Agent instance using the OpenAI Agents SDK and records the assistant locally.
-    If the Agent instance does not provide an ID, we generate one.
+    Creates an Agent instance using the OpenAI Agents SDK with guardrails,
+    tracing, and handoffs; then records the assistant locally.
     """
-    try:
-        agent = Agent(
-            name=name,
-            instructions=instructions,
-            model=model
-        )
-    except Exception as e:
-        logger.exception("Failed to create agent: %s", e)
-        raise e
+    # Ensure OPENAI_API_KEY is set for this process
+    apply_openai_key(user)
 
-    # If agent.id is None or falsy, generate a new unique ID.
+    # Define a handoff helper agent, if desired:
+    helper = Agent(
+        name="MemoryButler",
+        instructions="Manage long‑term memory entries",
+        model=model,
+    )
+
+    # Instantiate the primary agent with guardrails (dict), tracing, and handoffs
+    agent = Agent(
+        name=name,
+        instructions=instructions,
+        model=model,
+        input_guardrails=[validate_user_input],
+        handoffs=[helper],
+    )
+
+    # If SDK didn't assign an ID, generate one
     if not getattr(agent, "id", None):
         agent.id = "agent_" + str(uuid.uuid4())
 
+    # Persist locally
     assistant = Assistant.objects.create(
         user=user,
         name=name,
         instructions=instructions,
         model=model,
         ai_provider="openai",
-        provider_assistant_id=agent.id,  # Now guaranteed to be non-null
-        metadata={"tools": getattr(agent, "tools", []), "files": getattr(agent, "files", [])}
+        provider_assistant_id=agent.id,
+        metadata={
+            "tools": getattr(agent, "tools", []),
+            "trace_enabled": True
+        }
     )
+
+    logger.info("Created assistant: %s (%s)", assistant.name, assistant.provider_assistant_id)
     return assistant
 
 def soft_delete_local(assistant_id, user):
     """
-    Performs a soft delete of the assistant in the local database.
+    Soft‑delete the assistant record locally.
     """
     assistant = Assistant.objects.get(provider_assistant_id=assistant_id, user=user)
     assistant.deleted = True
     assistant.save()
+    logger.info("Soft‑deleted assistant: %s", assistant_id)
     return assistant

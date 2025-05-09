@@ -1,3 +1,4 @@
+#threads/models.py
 from django.db import models
 from django.conf import settings
 from assistants.models import Assistant

@@ -1,3 +1,4 @@
+#ai_providers/base.py
 class AIProviderBase:
     def create_assistant(self, user, **kwargs): raise NotImplementedError()
     def update_assistant(self, assistant_id, user, **kwargs): raise NotImplementedError()

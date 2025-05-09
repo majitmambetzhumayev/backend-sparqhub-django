@@ -1,38 +1,71 @@
+version: "3.9"
+
+x-service-defaults: &service-defaults
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  volumes:
+    - .:/app:delegated
+  restart: unless-stopped
+
 services:
-  django:
-    build: .
-    command: uvicorn backend_sparqhub_django.asgi:application --host 0.0.0.0 --port 8000
-    volumes:
-      - .:/app
+  web:
+    <<: *service-defaults
+    entrypoint: ["/app/entrypoint.sh"]
+    command: ["uvicorn", "backend_sparqhub_django.asgi:application", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "8000:8000"
     depends_on:
-      - postgres
-      - redis
-
-  postgres:
-    image: postgres:latest
-    container_name: my-postgres
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=Zenith100+
-      - POSTGRES_DB=mydb
-    volumes:
-      - ~/docker/pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-
-  redis:
-    image: redis:latest
-    container_name: redis
-    ports:
-      - "6379:6379"
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/healthcheck/"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
 
   celery:
-    build: .
-    command: celery -A backend_sparqhub_django worker --loglevel=info
-    volumes:
-      - .:/app
+    <<: *service-defaults
+    entrypoint: ["/app/entrypoint.sh"]
+    command: [
+      "celery", "-A", "backend_sparqhub_django", "worker",
+      "--loglevel=info", "--concurrency=4"
+    ]
     depends_on:
-      - django
-      - redis
+      web:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:15-alpine
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${DATABASE_USER}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+      POSTGRES_DB: ${DATABASE_NAME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${DATABASE_USER}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  pgdata:

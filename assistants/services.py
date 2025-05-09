@@ -1,3 +1,4 @@
+#assistant/services.py
 import logging
 from .models import Assistant
 from ai_providers.factory import get_provider

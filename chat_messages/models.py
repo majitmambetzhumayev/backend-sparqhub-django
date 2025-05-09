@@ -1,3 +1,4 @@
+#chat_messages/models.py
 from django.db import models
 from threads.models import Thread
 
