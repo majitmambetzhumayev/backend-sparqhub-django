@@ -15,11 +15,11 @@ class CustomUser(AbstractUser):
     preferred_integration = models.CharField(
         max_length=20,
         choices=(
+            ('anthropic', 'Anthropic'),
             ('openai', 'OpenAI'),
             ('mistral', 'Mistral'),
-            ('made', 'Made.com'),
         ),
-        default='openai',
+        default='anthropic',
     )
     phone_number = models.CharField(max_length=20, blank=True, null=True)
 
