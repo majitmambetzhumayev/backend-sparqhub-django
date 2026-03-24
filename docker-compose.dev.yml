@@ -1,9 +1,13 @@
 x-app: &app
   build:
     context: .
-    dockerfile: Dockerfile
+    dockerfile: Dockerfile.dev
   env_file: .env
-  restart: unless-stopped
+  environment:
+    DATABASE_HOST: db
+    REDIS_URL: redis://redis:6379/0
+  volumes:
+    - .:/app
   depends_on:
     db:
       condition: service_healthy
@@ -19,12 +23,14 @@ services:
       POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
       POSTGRES_DB: ${DATABASE_NAME}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata_dev:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "${DATABASE_USER}"]
       interval: 10s
       retries: 5
       start_period: 5s
+    ports:
+      - "5432:5432"
     restart: unless-stopped
 
   redis:
@@ -36,31 +42,14 @@ services:
       retries: 5
       start_period: 5s
 
-  migrate:
-    <<: *app
-    command: python manage.py migrate --noinput
-    restart: "no"
-
   web:
     <<: *app
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
     ports:
       - "8000:8000"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/healthcheck/"]
-      interval: 10s
-      retries: 5
-      start_period: 5s
 
   celery:
     <<: *app
-    command: celery -A backend_sparqhub_django worker --loglevel=info --concurrency=4
+    command: celery -A backend_sparqhub_django worker --loglevel=info --concurrency=2
 
 volumes:
-  pgdata:
+  pgdata_dev:
