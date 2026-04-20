@@ -1,6 +1,5 @@
 from asgiref.sync import async_to_sync
 from django.views.decorators.csrf import csrf_protect
-from django.utils.decorators import method_decorator
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -11,12 +10,14 @@ from librarian.services import retrieve_relevant_memories
 from threads.models import Thread
 
 
-@method_decorator(csrf_protect, name=’dispatch’)
 class SendMessageAPIView(APIView):
     """
     POST /api/threads/             → create thread + send first message
     POST /api/threads/<thread_id>/ → append message to existing thread
     """
+
+    def dispatch(self, request, *args, **kwargs):
+        return csrf_protect(super().dispatch)(request, *args, **kwargs)
 
     def post(self, request, thread_id=None, format=None):
         text = request.data.get("message")
