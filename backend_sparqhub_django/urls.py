@@ -62,6 +62,11 @@ urlpatterns += [
     path('api/', include('chat_messages.urls')),
 ]
 
+# Librarian (RAG memories)
+urlpatterns += [
+    path('api/', include('librarian.urls')),
+]
+
 # Healthcheck
 def healthcheck(request):
     return JsonResponse({"status": "ok"})
