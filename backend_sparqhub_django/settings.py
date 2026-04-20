@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     'channels',
     'corsheaders',
     'encrypted_model_fields',
+    'pgvector.django',
     'core',
     'users',
     'assistants',
