@@ -1,12 +1,9 @@
-import logging
 from functools import lru_cache
 
 from pgvector.django import CosineDistance
 from sentence_transformers import SentenceTransformer
 
 from .models import MemoryEntry
-
-logger = logging.getLogger(__name__)
 
 _MODEL_NAME = 'all-MiniLM-L6-v2'
 _TOP_K = 5
