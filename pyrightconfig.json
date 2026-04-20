@@ -1,0 +1,5 @@
+{
+  "venvPath": ".",
+  "venv": "venv",
+  "djangoSettings": "backend_sparqhub_django.settings"
+}
