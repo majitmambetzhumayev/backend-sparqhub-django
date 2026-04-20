@@ -7,7 +7,9 @@ django-cors-headers
 django-encrypted-model-fields
 djangorestframework
 djangorestframework-simplejwt
+pgvector
 psycopg2-binary
 python-decouple
+sentence-transformers
 uvicorn[standard]
 whitenoise

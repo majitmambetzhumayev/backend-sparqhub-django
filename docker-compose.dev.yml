@@ -16,7 +16,7 @@ x-app: &app
 
 services:
   db:
-    image: postgres:15-alpine
+    image: pgvector/pgvector:pg15
     env_file: .env
     environment:
       POSTGRES_USER: ${DATABASE_USER}
