@@ -36,6 +36,8 @@ INSTALLED_APPS = [
     'user_settings',
     'librarian',
     'keys',
+    'mcp_server',
+    'mcp_client',
 ]
 
 MIDDLEWARE = [
