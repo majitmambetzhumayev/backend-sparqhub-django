@@ -63,6 +63,15 @@ class DeductCreditsTest(TransactionTestCase):
         self.user.refresh_from_db()
         self.assertEqual(self.user.credits_remaining, 100)
 
+    def test_includes_extra_credits_from_usage(self):
+        # extra_credits carries costs from tools priced outside the main
+        # provider/model (e.g. image generation) so they're deducted in the
+        # same atomic call as the turn's token usage.
+        usage = UsageAccumulator(input_tokens=0, output_tokens=0, extra_credits=50)
+        run(deduct_credits(self.user, 'anthropic', 'claude-sonnet-5', usage))
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.credits_remaining, 100 - 50)
+
 
 class SendChatMessageCreditsGateTest(TransactionTestCase):
     def setUp(self):
@@ -91,6 +100,31 @@ class SendChatMessageCreditsGateTest(TransactionTestCase):
 
         self.assertEqual(result, 'Hi there!')
         self.assertFalse(used_global_key)
+
+    @patch('ai_providers.chat_router.get_provider')
+    @patch('ai_providers.chat_router.run_agent_loop', new_callable=AsyncMock, return_value='Hi there!')
+    @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
+    def test_blocks_once_credits_run_out_mid_connection(self, mock_get_key, mock_run_loop, mock_get_provider):
+        # Regression test: on a long-lived WS connection, `user` is the same
+        # in-memory object across every message (resolved once at connect
+        # time). The gate must re-check the DB, not a stale in-memory
+        # attribute, or a user who starts with credits never gets blocked
+        # after they're exhausted mid-connection.
+        user = User.objects.create_user(username='longlived', password='pass', credits_remaining=1)
+        assistant = Assistant.objects.create(
+            user=user, name='A', instructions='Be helpful.', ai_provider='anthropic',
+        )
+        mock_get_provider.return_value = MagicMock()
+
+        run(send_chat_message(assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=user))
+
+        # Credits are exhausted directly in the DB (simulating a deduction
+        # from an earlier message on this same connection) without touching
+        # the in-memory `user` object's cached attribute.
+        User.objects.filter(pk=user.pk).update(credits_remaining=0)
+
+        with self.assertRaises(InsufficientCreditsError):
+            run(send_chat_message(assistant, 'Hello again', ai_provider='anthropic', model='claude-sonnet-5', user=user))
 
 
 class GetMcpContextTest(TransactionTestCase):
@@ -141,13 +175,34 @@ class GetMcpContextTest(TransactionTestCase):
         self.assertEqual(tools, [])
         self.assertIsNone(tool_executor)
 
+    @patch('mcp_client.services.get_tools_from_server')
+    @patch('mcp_client.services.call_tool', new_callable=AsyncMock, return_value='from first server')
+    def test_tool_name_collision_across_servers_keeps_first_consistently(self, mock_call_tool, mock_get_tools):
+        # Regression test: previously the tools list kept BOTH duplicate
+        # entries while the dispatch map only kept the last server, so the
+        # list and the actual routing disagreed. Now both consistently
+        # resolve to the first server that exposed the name.
+        first = MCPServer.objects.create(project=self.project, name='First', transport='stdio', command='python')
+        second = MCPServer.objects.create(project=self.project, name='Second', transport='stdio', command='python')
+
+        async def fake_get_tools(server):
+            return [{'name': 'search', 'description': '', 'input_schema': {}}]
+
+        mock_get_tools.side_effect = fake_get_tools
+
+        tools, tool_executor = run(_get_mcp_context(self.project.id))
+
+        self.assertEqual([t['name'] for t in tools], ['search'])
+        self.assertEqual(run(tool_executor('search', {})), 'from first server')
+        mock_call_tool.assert_awaited_once_with(first, 'search', {})
+
 
 class BuildImageToolTest(TransactionTestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='imageuser', password='pass', credits_remaining=100)
 
     def test_returns_none_for_provider_without_image_support(self):
-        tool, executor = _build_image_tool('anthropic', None, self.user, True)
+        tool, executor = _build_image_tool('anthropic', None, self.user, True, UsageAccumulator())
         self.assertIsNone(tool)
         self.assertIsNone(executor)
 
@@ -160,7 +215,7 @@ class BuildImageToolTest(TransactionTestCase):
         ))
         mock_get_provider.return_value = provider
 
-        tool, executor = _build_image_tool('openai', None, self.user, False)
+        tool, executor = _build_image_tool('openai', None, self.user, False, UsageAccumulator())
 
         self.assertEqual(tool['name'], 'generate_image')
         result = run(executor({'prompt': 'a cat'}))
@@ -169,32 +224,40 @@ class BuildImageToolTest(TransactionTestCase):
 
     @patch('image_providers.services.save_generated_image', return_value='http://localhost:8000/media/generated_images/x.png')
     @patch('image_providers.factory.get_image_provider')
-    def test_deducts_credits_when_global_key_used(self, mock_get_provider, mock_save):
+    def test_accumulates_extra_credits_when_global_key_used_without_deducting_immediately(self, mock_get_provider, mock_save):
+        # Regression test: image cost must NOT be deducted eagerly inside the
+        # tool — it should only accumulate onto usage.extra_credits, so the
+        # caller can defer the actual deduction until the whole turn succeeds
+        # (a subsequent failed model call must not have already charged the user).
         provider = OpenAIImageProvider(api_key='test')
         provider.generate = AsyncMock(return_value=ImageResult(
             data=b'x', mime_type='image/png', usage={'input_tokens': 1_000_000, 'output_tokens': 1_000_000},
         ))
         mock_get_provider.return_value = provider
 
-        _, executor = _build_image_tool('openai', None, self.user, True)
+        usage = UsageAccumulator()
+        _, executor = _build_image_tool('openai', None, self.user, True, usage)
         run(executor({'prompt': 'a cat'}))
 
         self.user.refresh_from_db()
         # gpt-image-2: $8/$30 per 1M tokens. 1M input + 1M output = $38 = 3800 credits at $0.01/credit.
-        self.assertEqual(self.user.credits_remaining, 100 - 3800)
+        self.assertEqual(usage.extra_credits, 3800)
+        self.assertEqual(self.user.credits_remaining, 100)
 
     @patch('image_providers.services.save_generated_image', return_value='http://localhost:8000/media/generated_images/x.png')
     @patch('image_providers.factory.get_image_provider')
-    def test_does_not_deduct_credits_when_personal_key_used(self, mock_get_provider, mock_save):
+    def test_does_not_accumulate_credits_when_personal_key_used(self, mock_get_provider, mock_save):
         provider = OpenAIImageProvider(api_key='test')
         provider.generate = AsyncMock(return_value=ImageResult(
             data=b'x', mime_type='image/png', usage={'input_tokens': 1_000_000, 'output_tokens': 1_000_000},
         ))
         mock_get_provider.return_value = provider
 
-        _, executor = _build_image_tool('openai', 'sk-personal', self.user, False)
+        usage = UsageAccumulator()
+        _, executor = _build_image_tool('openai', 'sk-personal', self.user, False, usage)
         run(executor({'prompt': 'a cat'}))
 
+        self.assertEqual(usage.extra_credits, 0)
         self.user.refresh_from_db()
         self.assertEqual(self.user.credits_remaining, 100)
 
@@ -303,17 +366,20 @@ class BuildDelegateToolTest(TransactionTestCase):
         call_kwargs = mock_send.call_args.kwargs
         self.assertEqual(call_kwargs['model'], PROVIDERS['openai'].AVAILABLE_MODELS[0]['id'])
 
-    def test_proceeds_without_confirmation_hook(self):
+    def test_fails_closed_without_confirmation_hook(self):
+        # Security-critical: delegate_to_model's entire premise is "asks the
+        # user first". A caller with no confirmation channel (e.g. the plain
+        # HTTP send-message endpoint, which has no interactive round-trip)
+        # must not silently skip confirmation and dispatch anyway.
         with patch('ai_providers.chat_router.send_chat_message', new_callable=AsyncMock) as mock_send:
-            mock_send.return_value = ('OK', None, False)
             _, executor = _build_delegate_tool(self.user, None)
 
             result = run(executor({
                 'provider': 'gemini', 'model': 'gemini-2.5-flash', 'prompt': 'a cat', 'reason': 'x',
             }))
 
-            self.assertIn('OK', result)
-            mock_send.assert_awaited_once()
+            self.assertIn('requires interactive user confirmation', result)
+            mock_send.assert_not_awaited()
 
     def test_unknown_provider_returns_error_text_without_dispatching(self):
         _, executor = _build_delegate_tool(self.user, AsyncMock(return_value=True))

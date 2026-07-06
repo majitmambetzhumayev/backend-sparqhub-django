@@ -14,7 +14,7 @@ from ai_providers.chat_router import InsufficientCreditsError
 from assistants.models import Assistant
 from chat_messages.consumers import ConversationConsumer
 from chat_messages.models import Message
-from chat_messages.services import send_message
+from chat_messages.services import send_message, _record_turn
 from threads.models import Thread
 
 User = get_user_model()
@@ -134,6 +134,31 @@ class SendMessageServiceTest(TransactionTestCase):
         mock_deduct.assert_not_awaited()
 
 
+    def test_record_turn_rebuilds_conversation_state_from_message_table_not_stale_history(self):
+        # Regression test for the conversation_state race: two concurrent
+        # turns on the same thread (e.g. two open tabs) each capture `history`
+        # before their AI call. If one turn's Message rows are persisted
+        # before the other's _record_turn runs, appending onto the stale
+        # `history` snapshot would silently drop that concurrent exchange.
+        # _record_turn must rebuild from the Message table (source of truth).
+        Message.objects.create(thread=self.thread, sender="user", content="Concurrent turn's message")
+        Message.objects.create(thread=self.thread, sender="assistant", content="Concurrent turn's reply")
+
+        stale_history = []  # captured before the concurrent turn committed anything
+        _record_turn(self.thread, stale_history, "Hello", "Hi there!")
+
+        self.thread.refresh_from_db()
+        self.assertEqual(
+            self.thread.conversation_state,
+            [
+                {"role": "user", "content": "Concurrent turn's message"},
+                {"role": "assistant", "content": "Concurrent turn's reply"},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there!"},
+            ],
+        )
+
+
 class ConversationConsumerTest(TransactionTestCase):
     def setUp(self):
         self.user = User.objects.create_user(username="wsuser", password="pass")
@@ -206,6 +231,63 @@ class ConversationConsumerTest(TransactionTestCase):
         self.assertEqual(frames[1], {"status": "tool_call", "tool": "search_memories"})
         self.assertEqual(frames[2], {"chunk": "Done."})
         self.assertEqual(frames[3]["done"], True)
+
+    @patch('chat_messages.services.generate_thread_title_task')
+    @patch('chat_messages.services.extract_memories_task')
+    @patch('chat_messages.consumers.retrieve_relevant_memories', return_value=[])
+    @patch('chat_messages.services.send_chat_message')
+    def test_rejects_second_message_while_a_turn_is_still_in_flight(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # Regression test: _pending_confirmation/_active_task are single
+        # instance attributes on the consumer. Without this guard, a second
+        # message sent on the same connection while a turn is still running
+        # would spawn a second concurrent _handle_chat_message task, and if
+        # both ended up awaiting confirmation, the second would silently
+        # steal/overwrite the first turn's confirmation future — leaving the
+        # first turn hanging forever with no error ever sent.
+        release_first_call = asyncio.Event()
+        entered_first_call = asyncio.Event()
+
+        async def fake_send_chat_message(*args, **kwargs):
+            entered_first_call.set()
+            await release_first_call.wait()
+
+            async def fake_chunks():
+                yield "Done."
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": None, "message": "First"})
+            thinking_frame = await communicator.receive_json_from()
+            await entered_first_call.wait()
+
+            await communicator.send_json_to({"thread_id": None, "message": "Second"})
+            rejection_frame = await communicator.receive_json_from()
+
+            release_first_call.set()
+            chunk_frame = await communicator.receive_json_from()
+            done_frame = await communicator.receive_json_from()
+
+            await communicator.disconnect()
+            return thinking_frame, rejection_frame, chunk_frame, done_frame
+
+        thinking_frame, rejection_frame, chunk_frame, done_frame = run(scenario())
+        self.assertEqual(thinking_frame, {"status": "thinking"})
+        self.assertIn("error", rejection_frame)
+        self.assertEqual(chunk_frame, {"chunk": "Done."})
+        self.assertTrue(done_frame["done"])
+        # send_chat_message was only ever invoked once — the second message
+        # was rejected before spawning a competing turn.
+        self.assertEqual(mock_send.call_count, 1)
 
     def test_rejects_anonymous_connection(self):
         from django.contrib.auth.models import AnonymousUser

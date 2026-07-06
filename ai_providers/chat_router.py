@@ -31,7 +31,7 @@ async def _get_mcp_context(project_id) -> tuple[list[dict], object]:
     if project_id is None:
         return [], None
 
-    servers = [s async for s in MCPServer.objects.filter(project_id=project_id, enabled=True)]
+    servers = [s async for s in MCPServer.objects.filter(project_id=project_id, enabled=True).order_by('id')]
     if not servers:
         return [], None
 
@@ -41,9 +41,21 @@ async def _get_mcp_context(project_id) -> tuple[list[dict], object]:
     for server in servers:
         try:
             tools = await get_tools_from_server(server)
-            all_tools.extend(tools)
             for tool in tools:
+                # First server to expose a given name wins, and is the only one
+                # advertised — keeps the tools list and the dispatch map
+                # consistent (previously the map kept the *last* server while
+                # the list still advertised every duplicate, so a name
+                # collision across two servers silently routed calls to
+                # whichever server happened to be processed last).
+                if tool["name"] in tool_server_map:
+                    logger.warning(
+                        "MCP tool name collision on %r between servers %s and %s; keeping %s",
+                        tool["name"], tool_server_map[tool["name"]].name, server.name, tool_server_map[tool["name"]].name,
+                    )
+                    continue
                 tool_server_map[tool["name"]] = server
+                all_tools.append(tool)
         except Exception:
             logger.warning("Failed to fetch tools from MCP server %s", server.name)
 
@@ -72,11 +84,17 @@ IMAGE_GENERATION_TOOL = {
 }
 
 
-def _build_image_tool(ai_provider: str, api_key: str | None, user, used_global_key: bool):
+def _build_image_tool(ai_provider: str, api_key: str | None, user, used_global_key: bool, usage: UsageAccumulator):
     """Returns (tool_schema, executor) for the built-in generate_image tool, or
     (None, None) when the current chat provider has no matching image
     capability registered — image generation reuses the same provider (and
-    BYOK key) as the current chat turn rather than a separately-chosen one."""
+    BYOK key) as the current chat turn rather than a separately-chosen one.
+
+    Cost is accumulated onto `usage.extra_credits` rather than deducted
+    immediately: deducting here would still charge the user even if a later
+    step in the same turn fails and the turn is never persisted. Deduction
+    happens once, alongside the rest of the turn's usage, only after the
+    caller (chat_messages/services.py) confirms the turn succeeded."""
     from image_providers.factory import get_image_provider
     from image_providers.services import save_generated_image
 
@@ -90,8 +108,7 @@ def _build_image_tool(ai_provider: str, api_key: str | None, user, used_global_k
         if used_global_key:
             image_usage = UsageAccumulator(**result.usage)
             cost = _compute_cost_credits(type(image_provider), image_provider.MODEL, image_usage)
-            if cost > 0:
-                await sync_to_async(_apply_credit_deduction)(user, cost)
+            usage.extra_credits += cost
         return f"![Generated image]({url})"
 
     return IMAGE_GENERATION_TOOL, executor
@@ -128,16 +145,21 @@ DELEGATE_TOOL = {
 def _build_delegate_tool(user, confirm_tool_call):
     """Returns (tool_schema, executor) for the built-in delegate_to_model tool —
     always offered, regardless of the current provider, since its whole point
-    is escalating to a DIFFERENT provider. Gated behind confirm_tool_call (if
-    given) so the user approves before the sub-call actually runs; the
-    delegated call itself is just a fresh, one-shot send_chat_message with
-    delegation disabled, so it can't recurse."""
+    is escalating to a DIFFERENT provider. Requires confirm_tool_call: this
+    tool's entire premise is "asks the user first", so a caller with no way to
+    ask (no confirm_tool_call provided) must fail closed rather than silently
+    running unconfirmed — the delegated call itself is just a fresh, one-shot
+    send_chat_message with delegation disabled, so it can't recurse."""
 
     async def executor(arguments: dict) -> str:
-        if confirm_tool_call is not None:
-            confirmed = await confirm_tool_call("delegate_to_model", arguments)
-            if not confirmed:
-                return "The user declined this delegation. Continue the conversation yourself, or ask what they'd like instead."
+        if confirm_tool_call is None:
+            return (
+                "Delegation requires interactive user confirmation, which isn't available in "
+                "this context. Continue the conversation yourself, or ask what they'd like instead."
+            )
+        confirmed = await confirm_tool_call("delegate_to_model", arguments)
+        if not confirmed:
+            return "The user declined this delegation. Continue the conversation yourself, or ask what they'd like instead."
 
         target_provider = arguments.get("provider", "")
         prompt = arguments.get("prompt", "")
@@ -194,8 +216,16 @@ def _apply_credit_deduction(user, cost: int) -> None:
     get_user_model().objects.filter(pk=user.pk).update(credits_remaining=F('credits_remaining') - cost)
 
 
+def _get_current_credits(user_id) -> int:
+    from django.contrib.auth import get_user_model
+
+    return get_user_model().objects.values_list('credits_remaining', flat=True).get(pk=user_id)
+
+
 async def deduct_credits(user, ai_provider: str, model: str, usage: UsageAccumulator | None) -> None:
     cost = _compute_cost_credits(PROVIDERS.get(ai_provider), model, usage)
+    if usage is not None:
+        cost += usage.extra_credits
     if cost > 0:
         await sync_to_async(_apply_credit_deduction)(user, cost)
 
@@ -221,10 +251,17 @@ async def send_chat_message(
     api_key = key_record.encrypted_key if key_record else None
     used_global_key = key_record is None
 
-    if used_global_key and user.credits_remaining <= 0:
-        raise InsufficientCreditsError(
-            "Crédit épuisé sur la clé partagée. Ajoute ta propre clé API dans Paramètres pour continuer."
-        )
+    if used_global_key:
+        # Re-fetch from the DB rather than trusting user.credits_remaining:
+        # on a long-lived WebSocket connection, `user` is the same in-memory
+        # object resolved once at connect time (users/ws_auth.py), so a stale
+        # attribute would never reflect credits already spent by earlier
+        # messages on that same connection, letting the gate never trigger.
+        current_credits = await sync_to_async(_get_current_credits)(user.pk)
+        if current_credits <= 0:
+            raise InsufficientCreditsError(
+                "Crédit épuisé sur la clé partagée. Ajoute ta propre clé API dans Paramètres pour continuer."
+            )
 
     try:
         provider = get_provider(ai_provider, api_key=api_key)
@@ -232,7 +269,8 @@ async def send_chat_message(
         messages = [*(conversation_history or []), {"role": "user", "content": message_text}]
         tools, mcp_executor = await _get_mcp_context(project_id)
 
-        image_tool, image_executor = _build_image_tool(ai_provider, api_key, user, used_global_key)
+        usage = UsageAccumulator()
+        image_tool, image_executor = _build_image_tool(ai_provider, api_key, user, used_global_key, usage)
         if image_tool is not None:
             tools = [*tools, image_tool]
 
@@ -254,7 +292,6 @@ async def send_chat_message(
         tool_executor = combined_executor if tools else None
 
         turn = SimpleNamespace(model=model, instructions=assistant.instructions)
-        usage = UsageAccumulator()
         if stream:
             result = provider.stream(turn, messages, system, tools, tool_executor, usage=usage, on_tool_call=on_tool_call)
         else:
