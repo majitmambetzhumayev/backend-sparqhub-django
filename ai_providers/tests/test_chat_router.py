@@ -203,14 +203,23 @@ class SendChatMessageImageToolTest(TransactionTestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='imgtooluser', password='pass', credits_remaining=100)
 
+    @patch('image_providers.factory.get_image_provider')
     @patch('ai_providers.chat_router.get_provider')
     @patch('ai_providers.chat_router.run_agent_loop', new_callable=AsyncMock, return_value='Hi there!')
     @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
-    def test_includes_image_tool_for_supported_provider(self, mock_get_key, mock_run_loop, mock_get_provider):
+    def test_includes_image_tool_for_supported_provider(
+        self, mock_get_key, mock_run_loop, mock_get_provider, mock_get_image_provider,
+    ):
+        # get_image_provider is mocked directly rather than relying on a real
+        # OpenAIImageProvider construction — the real OpenAI SDK validates
+        # credentials eagerly at construction time, so this would otherwise
+        # only pass in environments that happen to have a real
+        # OPENAI_API_KEY set (as this dev machine's .env does, unlike CI).
         assistant = Assistant.objects.create(
             user=self.user, name='A', instructions='Be helpful.', ai_provider='openai',
         )
         mock_get_provider.return_value = MagicMock()
+        mock_get_image_provider.return_value = MagicMock()
 
         run(send_chat_message(assistant, 'Hello', ai_provider='openai', model='gpt-5.4', user=self.user))
 
