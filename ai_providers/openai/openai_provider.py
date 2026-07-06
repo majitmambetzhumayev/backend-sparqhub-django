@@ -1,41 +1,36 @@
 import json
 from types import SimpleNamespace
 
-from mistralai.client import Mistral
+from openai import AsyncOpenAI
 from django.conf import settings
 
 from ai_providers.agent_loop import run_agent_loop
 from ai_providers.base import AIProviderBase, ProviderResponse, ToolCall, UsageAccumulator
 
 
-class MistralProvider(AIProviderBase):
-    label = "Mistral"
+class OpenAIProvider(AIProviderBase):
+    label = "OpenAI"
     AVAILABLE_MODELS = [
-        {"id": "mistral-large-latest", "label": "Mistral Large"},
-        {"id": "mistral-medium-latest", "label": "Mistral Medium"},
-        {"id": "mistral-small-latest", "label": "Mistral Small"},
-        {"id": "ministral-8b-latest", "label": "Ministral 8B"},
+        {"id": "gpt-5.5", "label": "GPT-5.5"},
+        {"id": "gpt-5.4", "label": "GPT-5.4"},
+        {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
+        {"id": "gpt-5.4-nano", "label": "GPT-5.4 Nano"},
     ]
     # USD per 1M tokens.
     PRICING = {
-        "mistral-large-latest": {"input": 0.50, "output": 1.50},
-        "mistral-medium-latest": {"input": 1.50, "output": 7.50},
-        "mistral-small-latest": {"input": 0.15, "output": 0.60},
-        "ministral-8b-latest": {"input": 0.15, "output": 0.15},
+        "gpt-5.5": {"input": 5.00, "output": 30.00},
+        "gpt-5.4": {"input": 2.50, "output": 15.00},
+        "gpt-5.4-mini": {"input": 0.75, "output": 4.50},
+        "gpt-5.4-nano": {"input": 0.20, "output": 1.25},
     }
 
     def __init__(self, api_key: str | None = None):
-        self.client = Mistral(api_key=api_key or settings.MISTRAL_API_KEY)
-
-    @staticmethod
-    def _normalize_arguments(arguments) -> dict:
-        # Mistral's SDK types `arguments` as `str | dict` depending on the call path.
-        return json.loads(arguments) if isinstance(arguments, str) else arguments
+        self.client = AsyncOpenAI(api_key=api_key or settings.OPENAI_API_KEY)
 
     def _build_kwargs(self, assistant, messages, system, tools):
         kwargs = {
             "model": assistant.model,
-            "max_tokens": 8192,
+            "max_completion_tokens": 8192,
             "messages": [{"role": "system", "content": system or assistant.instructions}, *messages],
         }
         if tools:
@@ -56,7 +51,11 @@ class MistralProvider(AIProviderBase):
     def _to_provider_response(raw) -> ProviderResponse:
         message = raw.choices[0].message
         tool_calls = [
-            ToolCall(id=call.id, name=call.function.name, arguments=MistralProvider._normalize_arguments(call.function.arguments))
+            ToolCall(
+                id=call.id,
+                name=call.function.name,
+                arguments=json.loads(call.function.arguments) if call.function.arguments else {},
+            )
             for call in (message.tool_calls or [])
         ]
         usage = {"input_tokens": raw.usage.prompt_tokens, "output_tokens": raw.usage.completion_tokens}
@@ -64,7 +63,7 @@ class MistralProvider(AIProviderBase):
 
     async def complete(self, assistant, messages, system, tools) -> ProviderResponse:
         kwargs = self._build_kwargs(assistant, messages, system, tools)
-        raw = await self.client.chat.complete_async(**kwargs)
+        raw = await self.client.chat.completions.create(**kwargs)
         return self._to_provider_response(raw)
 
     def append_turn(self, messages, response: ProviderResponse, tool_results=None) -> list[dict]:
@@ -92,14 +91,15 @@ class MistralProvider(AIProviderBase):
         usage: UsageAccumulator | None = None, on_tool_call=None,
     ):
         kwargs = self._build_kwargs(assistant, messages, system, tools)
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
 
         text_parts = []
         tool_call_chunks: dict[int, dict] = {}
         raw_usage = None
 
-        event_stream = await self.client.chat.stream_async(**kwargs)
-        async for event in event_stream:
-            chunk = event.data
+        stream = await self.client.chat.completions.create(**kwargs)
+        async for chunk in stream:
             if chunk.usage:
                 raw_usage = chunk.usage
             if not chunk.choices:
@@ -109,8 +109,7 @@ class MistralProvider(AIProviderBase):
                 text_parts.append(delta.content)
                 yield delta.content
             for tc_delta in delta.tool_calls or []:
-                index = tc_delta.index or 0
-                acc = tool_call_chunks.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                acc = tool_call_chunks.setdefault(tc_delta.index, {"id": "", "name": "", "arguments": ""})
                 if tc_delta.id:
                     acc["id"] = tc_delta.id
                 if tc_delta.function:
@@ -133,7 +132,7 @@ class MistralProvider(AIProviderBase):
         raw_message = SimpleNamespace(
             content="".join(text_parts) or None,
             tool_calls=[
-                SimpleNamespace(id=call.id, function=SimpleNamespace(name=call.name, arguments=call.arguments))
+                SimpleNamespace(id=call.id, function=SimpleNamespace(name=call.name, arguments=json.dumps(call.arguments)))
                 for call in tool_calls
             ] or None,
         )

@@ -4,13 +4,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from django.test import SimpleTestCase
 
 from ai_providers.anthropic.anthropic_provider import AnthropicProvider
+from ai_providers.base import ProviderResponse, ToolCall
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
-class AnthropicProviderChatTest(SimpleTestCase):
+class AnthropicProviderCompleteTest(SimpleTestCase):
     def setUp(self):
         with patch('ai_providers.anthropic.anthropic_provider.anthropic.AsyncAnthropic'):
             self.provider = AnthropicProvider()
@@ -18,106 +19,69 @@ class AnthropicProviderChatTest(SimpleTestCase):
         self.assistant.model = 'claude-sonnet-4-6'
         self.assistant.instructions = 'Be helpful.'
 
-    def _make_text_response(self, text: str, stop_reason: str = 'end_turn'):
+    def _make_text_response(self, text: str, input_tokens=10, output_tokens=5):
         block = MagicMock()
         block.type = 'text'
         block.text = text
         response = MagicMock()
-        response.stop_reason = stop_reason
         response.content = [block]
+        response.usage = MagicMock(input_tokens=input_tokens, output_tokens=output_tokens)
         return response
 
-    def test_returns_text_from_response(self):
-        self.provider.client.messages.create = AsyncMock(
-            return_value=self._make_text_response('Hello!')
-        )
-        result = run(self.provider.chat(
-            self.assistant, [{'role': 'user', 'content': 'Hi'}], system='Be helpful.'
-        ))
-        self.assertEqual(result, 'Hello!')
+    def _make_tool_use_response(self, call_id, name, arguments, input_tokens=10, output_tokens=5):
+        block = MagicMock()
+        block.type = 'tool_use'
+        block.id = call_id
+        block.name = name
+        block.input = arguments
+        response = MagicMock()
+        response.content = [block]
+        response.usage = MagicMock(input_tokens=input_tokens, output_tokens=output_tokens)
+        return response
 
-    def test_does_not_include_tools_param_when_no_tools(self):
-        self.provider.client.messages.create = AsyncMock(
-            return_value=self._make_text_response('OK')
-        )
-        run(self.provider.chat(
-            self.assistant, [{'role': 'user', 'content': 'Hi'}], system='Be helpful.'
-        ))
+    def test_complete_returns_text_response(self):
+        self.provider.client.messages.create = AsyncMock(return_value=self._make_text_response('Hello!'))
+        result = run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Hi'}], 'Be helpful.', None))
+        self.assertEqual(result.text, 'Hello!')
+        self.assertFalse(result.requires_tool_execution)
+
+    def test_complete_does_not_include_tools_param_when_no_tools(self):
+        self.provider.client.messages.create = AsyncMock(return_value=self._make_text_response('OK'))
+        run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Hi'}], 'Be helpful.', None))
         call_kwargs = self.provider.client.messages.create.call_args.kwargs
         self.assertNotIn('tools', call_kwargs)
 
-    def test_includes_tools_param_when_tools_provided(self):
-        self.provider.client.messages.create = AsyncMock(
-            return_value=self._make_text_response('OK')
-        )
+    def test_complete_includes_tools_param_when_tools_provided(self):
+        self.provider.client.messages.create = AsyncMock(return_value=self._make_text_response('OK'))
         tools = [{'name': 'my_tool', 'description': '...', 'input_schema': {}}]
-        run(self.provider.chat(
-            self.assistant, [{'role': 'user', 'content': 'Hi'}],
-            system='Be helpful.', tools=tools,
-        ))
+        run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Hi'}], 'Be helpful.', tools))
         call_kwargs = self.provider.client.messages.create.call_args.kwargs
         self.assertIn('tools', call_kwargs)
         self.assertEqual(call_kwargs['tools'], tools)
 
-    def test_executes_tool_use_loop_and_returns_final_text(self):
-        tool_block = MagicMock()
-        tool_block.type = 'tool_use'
-        tool_block.id = 'toolu_abc'
-        tool_block.name = 'get_data'
-        tool_block.input = {'param': 'value'}
-
-        tool_response = MagicMock()
-        tool_response.stop_reason = 'tool_use'
-        tool_response.content = [tool_block]
-
-        final_response = self._make_text_response('Done using the tool.')
-
+    def test_complete_extracts_tool_calls(self):
         self.provider.client.messages.create = AsyncMock(
-            side_effect=[tool_response, final_response]
+            return_value=self._make_tool_use_response('toolu_abc', 'get_data', {'param': 'value'})
         )
-        mock_executor = AsyncMock(return_value='tool result data')
-        tools = [{'name': 'get_data', 'description': '...', 'input_schema': {}}]
+        result = run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Do it'}], 'sys', None))
+        self.assertTrue(result.requires_tool_execution)
+        self.assertEqual(result.tool_calls, [ToolCall(id='toolu_abc', name='get_data', arguments={'param': 'value'})])
 
-        result = run(self.provider.chat(
-            self.assistant,
-            [{'role': 'user', 'content': 'Do it'}],
-            system='Be helpful.',
-            tools=tools,
-            tool_executor=mock_executor,
-        ))
-
-        self.assertEqual(result, 'Done using the tool.')
-        mock_executor.assert_called_once_with('get_data', {'param': 'value'})
-        self.assertEqual(self.provider.client.messages.create.call_count, 2)
-
-    def test_tool_result_appended_to_messages_on_second_call(self):
-        tool_block = MagicMock()
-        tool_block.type = 'tool_use'
-        tool_block.id = 'toolu_xyz'
-        tool_block.name = 'my_tool'
-        tool_block.input = {}
-
-        tool_response = MagicMock()
-        tool_response.stop_reason = 'tool_use'
-        tool_response.content = [tool_block]
-
-        final_response = self._make_text_response('Final.')
-
+    def test_complete_captures_usage(self):
         self.provider.client.messages.create = AsyncMock(
-            side_effect=[tool_response, final_response]
+            return_value=self._make_text_response('Hi', input_tokens=42, output_tokens=17)
         )
-        mock_executor = AsyncMock(return_value='result')
+        result = run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Hi'}], 'sys', None))
+        self.assertEqual(result.usage, {'input_tokens': 42, 'output_tokens': 17})
 
-        run(self.provider.chat(
-            self.assistant,
-            [{'role': 'user', 'content': 'Go'}],
-            system='sys',
-            tools=[{'name': 'my_tool', 'description': '', 'input_schema': {}}],
-            tool_executor=mock_executor,
-        ))
+    def test_append_turn_builds_tool_result_message(self):
+        raw = self._make_tool_use_response('toolu_xyz', 'my_tool', {})
+        response = ProviderResponse(text='', tool_calls=[ToolCall(id='toolu_xyz', name='my_tool', arguments={})], raw=raw)
 
-        second_call_kwargs = self.provider.client.messages.create.call_args_list[1].kwargs
-        messages = second_call_kwargs['messages']
+        messages = self.provider.append_turn(
+            [{'role': 'user', 'content': 'Go'}], response, tool_results=[('toolu_xyz', 'result')],
+        )
+
         self.assertEqual(messages[-1]['role'], 'user')
         tool_result = messages[-1]['content'][0]
         self.assertEqual(tool_result['type'], 'tool_result')
