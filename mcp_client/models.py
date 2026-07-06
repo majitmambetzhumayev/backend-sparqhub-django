@@ -7,8 +7,8 @@ class MCPServer(models.Model):
         ('sse', 'SSE'),
     ]
 
-    assistant = models.ForeignKey(
-        'assistants.Assistant',
+    project = models.ForeignKey(
+        'projects.Project',
         on_delete=models.CASCADE,
         related_name='mcp_servers',
     )
@@ -20,4 +20,4 @@ class MCPServer(models.Model):
     enabled = models.BooleanField(default=True)
 
     def __str__(self):
-        return f"{self.name} ({self.transport}) → {self.assistant.name}"
+        return f"{self.name} ({self.transport}) → {self.project.name}"

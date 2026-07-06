@@ -8,7 +8,7 @@ from mcp.client.sse import sse_client
 logger = logging.getLogger(__name__)
 
 
-def _to_anthropic_tool(tool) -> dict:
+def _to_tool_schema(tool) -> dict:
     return {
         "name": tool.name,
         "description": tool.description or "",
@@ -44,7 +44,7 @@ async def _open_session(server):
 async def get_tools_from_server(server) -> list[dict]:
     async with _open_session(server) as session:
         response = await session.list_tools()
-        return [_to_anthropic_tool(t) for t in response.tools]
+        return [_to_tool_schema(t) for t in response.tools]
 
 
 async def call_tool(server, tool_name: str, arguments: dict) -> str:
