@@ -1,59 +1,88 @@
+import asyncio
+
 from django.urls import reverse
-from rest_framework.test import APITestCase
-from rest_framework import status
+from rest_framework.test import APITestCase, APITransactionTestCase
 from django.contrib.auth import get_user_model
-from .models import APIKey
+from rest_framework import status
 from .services import (
     get_user_api_key,
     create_or_update_user_api_key,
     delete_user_api_key,
 )
+from .models import APIKey
 
 User = get_user_model()
 
-class APIKeyAPITests(APITestCase):
-    def setUp(self):
-        # Create a test user and log in
-        self.user = User.objects.create_user(username='testuser', password='testpass')
-        self.client.login(username='testuser', password='testpass')
-        
-        # Define sample data for an API key
-        self.api_key_data = {
-            "key_type": "openai",
-            "encrypted_key": "dummy_encrypted_key",
-            "encryption_key_id": "key_v1",
-        }
-        # URL for the APIKey viewset (registered with basename 'apikey')
-        self.url = reverse('apikey-list')
 
-    def test_create_api_key_via_api(self):
-        # Create API key via POST request to the viewset endpoint
-        response = self.client.post(self.url, data=self.api_key_data, format='json')
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data['key_type'], self.api_key_data['key_type'])
-        self.assertEqual(response.data['encryption_key_id'], self.api_key_data['encryption_key_id'])
-        # Check that the API key is associated with the logged-in user
-        self.assertEqual(response.data['user'], self.user.id)
+def run(coro):
+    return asyncio.run(coro)
+
+
+class APIKeyServiceTests(APITransactionTestCase):
+    # get_user_api_key() is async and hops to a different DB connection; a
+    # plain TestCase's uncommitted transaction from setUp() isn't visible
+    # there (same gotcha documented in chat_messages/tests.py).
+    def setUp(self):
+        self.user = User.objects.create_user(username='testuser', password='testpass')
 
     def test_get_api_key_service(self):
-        # Create an API key using the service function
-        create_or_update_user_api_key(self.user, 'openai', "dummy_encrypted_key", "key_v1")
-        api_key = get_user_api_key(self.user, 'openai')
+        create_or_update_user_api_key(self.user, 'anthropic', "dummy_encrypted_key")
+        api_key = run(get_user_api_key(self.user, 'anthropic'))
         self.assertIsNotNone(api_key)
-        self.assertEqual(api_key.encryption_key_id, "key_v1")
-        self.assertEqual(api_key.key_type, "openai")
+        self.assertEqual(api_key.key_type, "anthropic")
+        self.assertEqual(api_key.encrypted_key, "dummy_encrypted_key")
 
     def test_update_api_key_service(self):
-        # Create an API key then update it using the service layer
-        create_or_update_user_api_key(self.user, 'openai', "dummy_encrypted_key", "key_v1")
-        updated_api_key = create_or_update_user_api_key(self.user, 'openai', "new_dummy_encrypted_key", "key_v2")
-        self.assertEqual(updated_api_key.encryption_key_id, "key_v2")
+        create_or_update_user_api_key(self.user, 'anthropic', "dummy_encrypted_key")
+        first_key_id = APIKey.objects.get(user=self.user, key_type='anthropic').encryption_key_id
+        updated_api_key = create_or_update_user_api_key(self.user, 'anthropic', "new_dummy_encrypted_key")
         self.assertEqual(updated_api_key.encrypted_key, "new_dummy_encrypted_key")
+        self.assertNotEqual(updated_api_key.encryption_key_id, first_key_id)
+        self.assertEqual(APIKey.objects.filter(user=self.user, key_type='anthropic').count(), 1)
 
     def test_delete_api_key_service(self):
-        # Create an API key and then delete it
-        create_or_update_user_api_key(self.user, 'openai', "dummy_encrypted_key", "key_v1")
-        deleted_count = delete_user_api_key(self.user, 'openai')
+        create_or_update_user_api_key(self.user, 'anthropic', "dummy_encrypted_key")
+        deleted_count = delete_user_api_key(self.user, 'anthropic')
         self.assertEqual(deleted_count, 1)
-        api_key = get_user_api_key(self.user, 'openai')
+        api_key = run(get_user_api_key(self.user, 'anthropic'))
         self.assertIsNone(api_key)
+
+
+class APIKeyAPITest(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='apiuser', password='testpass')
+        self.client.force_authenticate(user=self.user)
+        self.url = reverse('apikey-list')
+
+    def test_create_key(self):
+        response = self.client.post(self.url, {"key_type": "anthropic", "raw_key": "sk-test-123"}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["key_type"], "anthropic")
+        self.assertNotIn("raw_key", response.data)
+        self.assertNotIn("encrypted_key", response.data)
+
+    def test_create_upserts_existing_key(self):
+        self.client.post(self.url, {"key_type": "anthropic", "raw_key": "sk-first"}, format='json')
+        self.client.post(self.url, {"key_type": "anthropic", "raw_key": "sk-second"}, format='json')
+        self.assertEqual(APIKey.objects.filter(user=self.user, key_type='anthropic').count(), 1)
+        self.assertEqual(APIKey.objects.get(user=self.user, key_type='anthropic').encrypted_key, "sk-second")
+
+    def test_list_never_leaks_raw_key(self):
+        create_or_update_user_api_key(self.user, 'anthropic', "sk-secret")
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("encrypted_key", response.data[0])
+        self.assertNotIn("raw_key", response.data[0])
+
+    def test_delete_key(self):
+        key = create_or_update_user_api_key(self.user, 'anthropic', "sk-secret")
+        response = self.client.delete(reverse('apikey-detail', kwargs={'pk': key.id}))
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(APIKey.objects.filter(pk=key.id).exists())
+
+    def test_only_returns_own_keys(self):
+        other_user = User.objects.create_user(username='otheruser', password='testpass')
+        create_or_update_user_api_key(other_user, 'anthropic', "sk-other")
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.data, [])
