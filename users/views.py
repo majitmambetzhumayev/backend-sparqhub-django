@@ -1,14 +1,15 @@
+from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAdminUser, IsAuthenticated, AllowAny
 from rest_framework.views import APIView
-from rest_framework import generics, status
+from rest_framework import generics, mixins, status, viewsets
 from django.conf import settings
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 
-from .serializers import UserRegisterSerializer, CurrentUserSerializer
+from .serializers import AdminUserSerializer, UserRegisterSerializer, CurrentUserSerializer
 
 
 def _set_auth_cookies(response, access, refresh=None):
@@ -19,6 +20,7 @@ def _set_auth_cookies(response, access, refresh=None):
 
 
 @method_decorator(ensure_csrf_cookie, name='dispatch')
+@method_decorator(csrf_exempt, name='dispatch')
 class CookieTokenObtainPairView(TokenObtainPairView):
     def post(self, request, *args, **kwargs):
         response = super().post(request, *args, **kwargs)
@@ -27,6 +29,7 @@ class CookieTokenObtainPairView(TokenObtainPairView):
         return response
 
 
+@method_decorator(csrf_exempt, name='dispatch')
 class CookieTokenRefreshView(TokenRefreshView):
     def post(self, request, *args, **kwargs):
         response = super().post(request, *args, **kwargs)
@@ -70,3 +73,17 @@ class CurrentUserAPIView(APIView):
     def get(self, request):
         serializer = CurrentUserSerializer(request.user)
         return Response({'user': serializer.data})
+
+
+class AdminUserViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Staff-only user management: list/view/edit users, including their
+    credits balance. No delete, no role changes — deliberately scoped to
+    what's needed rather than a full admin CRUD surface."""
+    permission_classes = [IsAdminUser]
+    serializer_class = AdminUserSerializer
+    queryset = get_user_model().objects.all().order_by('username')
