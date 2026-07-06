@@ -53,6 +53,16 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                 self._pending_confirmation.set_result(bool(data.get("confirmed")))
             return
 
+        # One turn at a time per connection: _pending_confirmation/_active_task
+        # are single instance attributes, so a second concurrent turn would
+        # silently steal/overwrite the first turn's confirmation future,
+        # leaving it hanging forever with no error. Only the client-side
+        # "busy" state prevented this before — nothing stopped a raw/buggy
+        # client from sending a second message while a turn is in flight.
+        if self._active_task is not None and not self._active_task.done():
+            await self.send(json.dumps({"error": "A previous message is still being processed."}))
+            return
+
         self._active_task = asyncio.create_task(self._handle_chat_message(data))
 
     async def _confirm_tool_call(self, tool_name: str, arguments: dict) -> bool:

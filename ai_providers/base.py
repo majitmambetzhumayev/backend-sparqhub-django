@@ -24,10 +24,17 @@ class ProviderResponse:
 class UsageAccumulator:
     """Mutable sink threaded by reference through complete()/stream()/run_agent_loop()
     so a multi-turn tool-calling loop accumulates total usage across every model
-    call in the turn, not just the last one."""
+    call in the turn, not just the last one.
+
+    `extra_credits` accumulates costs from tools priced outside the main
+    provider/model (e.g. image generation) so they're deducted together with
+    the rest of the turn's usage, once, only after the turn actually
+    succeeds — a tool that deducted eagerly would still charge the user even
+    if a later step in the same turn fails and the turn is never persisted."""
 
     input_tokens: int = 0
     output_tokens: int = 0
+    extra_credits: int = 0
 
     def add(self, input_tokens: int = 0, output_tokens: int = 0) -> None:
         self.input_tokens += input_tokens

@@ -1,8 +1,10 @@
 from asgiref.sync import sync_to_async
+from django.db import transaction
 
 from ai_providers.chat_router import send_chat_message, deduct_credits
 from chat_messages.models import Message
 from librarian.tasks import extract_memories_task
+from threads.models import Thread
 from threads.tasks import generate_thread_title_task
 
 
@@ -11,17 +13,33 @@ def _record_turn(thread, history, user_text, assistant_text):
         Message(thread=thread, sender="user", content=user_text),
         Message(thread=thread, sender="assistant", content=assistant_text),
     ])
-    thread.conversation_state = [
-        *history,
-        {"role": "user", "content": user_text},
-        {"role": "assistant", "content": assistant_text},
-    ]
-    update_fields = ["conversation_state", "updated_at"]
-    if not history:
-        thread.title = user_text[:100]
-        update_fields.append("title")
+    is_first_turn = not history
+    with transaction.atomic():
+        locked_thread = Thread.objects.select_for_update().get(pk=thread.pk)
+        # Rebuild conversation_state from the Message table (the source of
+        # truth, just written above) rather than appending onto the `history`
+        # snapshot taken before the — potentially slow — AI call. Two turns on
+        # the same thread can run concurrently (e.g. two open tabs); appending
+        # onto a stale snapshot means whichever save() lands last silently
+        # overwrites the other turn's exchange in conversation_state.
+        conversation_state = [
+            {"role": m.sender, "content": m.content}
+            for m in Message.objects.filter(thread=thread).order_by("timestamp", "id")
+        ]
+        locked_thread.conversation_state = conversation_state
+        update_fields = ["conversation_state", "updated_at"]
+        if is_first_turn:
+            locked_thread.title = user_text[:100]
+            update_fields.append("title")
+        locked_thread.save(update_fields=update_fields)
+    # Keep the caller's in-memory `thread` object in sync with what was
+    # actually persisted (post-rebuild) — callers that hold onto `thread`
+    # across multiple turns (e.g. a loop reusing the same instance) expect it
+    # to reflect the latest saved state, same as before this rebuild existed.
+    thread.conversation_state = conversation_state
+    if is_first_turn:
+        thread.title = locked_thread.title
         generate_thread_title_task.delay(thread.id, user_text[:500], assistant_text[:500])
-    thread.save(update_fields=update_fields)
     extract_memories_task.delay(thread.user_id, thread.assistant_id, user_text, assistant_text)
 
 
