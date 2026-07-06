@@ -7,7 +7,11 @@ django-cors-headers
 django-encrypted-model-fields
 djangorestframework
 djangorestframework-simplejwt
+google-genai
+httpx
 mcp>=1.2.0
+mistralai
+openai
 pgvector
 psycopg2-binary
 python-decouple

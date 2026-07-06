@@ -5,15 +5,15 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'backend_sparqhub_django.setting
 # 1️⃣ Initialize Django ASGI application first, so the app registry is ready.
 django_asgi_app = get_asgi_application()  # :contentReference[oaicite:0]{index=0}
 
-from channels.auth import AuthMiddlewareStack
 from channels.routing import ProtocolTypeRouter, URLRouter
 import chat_messages.routing  # Safe now—Django is fully loaded
+from users.ws_auth import JWTAuthMiddleware
 
 application = ProtocolTypeRouter({
     # HTTP → Django views
     "http": django_asgi_app,
     # WebSocket → Channels consumers
-    "websocket": AuthMiddlewareStack(
+    "websocket": JWTAuthMiddleware(
         URLRouter(chat_messages.routing.websocket_urlpatterns)
     ),
 })

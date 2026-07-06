@@ -18,7 +18,7 @@ class Assistant(models.Model):
     provider_assistant_id = models.CharField(max_length=255, unique=True, null=True, blank=True)
     name = models.CharField(max_length=255)
     instructions = models.TextField(blank=True)
-    model = models.CharField(max_length=100, default='claude-sonnet-4-6')
+    model = models.CharField(max_length=100, default='claude-sonnet-5')
     metadata = models.JSONField(blank=True, null=True)
     deleted = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -26,6 +26,15 @@ class Assistant(models.Model):
     ai_provider = models.CharField(max_length=50, choices=AI_PROVIDER_CHOICES, default='anthropic')
     is_persistent = models.BooleanField(default=False)
     supports_crud = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user'],
+                condition=models.Q(is_persistent=True),
+                name='unique_persistent_assistant_per_user',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.ai_provider})"

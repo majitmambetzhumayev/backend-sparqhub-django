@@ -1,0 +1,37 @@
+import shutil
+import tempfile
+
+from django.test import SimpleTestCase, override_settings
+
+from image_providers.services import save_generated_image
+
+_TEST_MEDIA_ROOT = tempfile.mkdtemp()
+
+
+@override_settings(MEDIA_ROOT=_TEST_MEDIA_ROOT, MEDIA_URL='media/', BACKEND_URL='http://localhost:8000')
+class SaveGeneratedImageTest(SimpleTestCase):
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(_TEST_MEDIA_ROOT, ignore_errors=True)
+        super().tearDownClass()
+
+    def test_returns_absolute_url_under_media(self):
+        url = save_generated_image(b'fake-bytes', 'image/png')
+        self.assertTrue(url.startswith('http://localhost:8000/media/generated_images/'))
+        self.assertTrue(url.endswith('.png'))
+
+    def test_picks_extension_from_mime_type(self):
+        url = save_generated_image(b'fake-bytes', 'image/jpeg')
+        self.assertTrue(url.endswith('.jpeg'))
+
+    def test_defaults_to_png_for_unknown_mime_type(self):
+        url = save_generated_image(b'fake-bytes', 'application/octet-stream')
+        self.assertTrue(url.endswith('.png'))
+
+    def test_file_is_actually_written_with_given_bytes(self):
+        from django.core.files.storage import default_storage
+
+        url = save_generated_image(b'exact-content', 'image/png')
+        relative_path = url.split('/media/', 1)[1]
+        with default_storage.open(relative_path) as f:
+            self.assertEqual(f.read(), b'exact-content')

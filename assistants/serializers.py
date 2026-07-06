@@ -13,9 +13,6 @@ class AssistantSerializer(serializers.ModelSerializer):
             'model',
             'metadata',
             'ai_provider',
-            'is_persistent',
-            'supports_crud',
-            'deleted',
             'created_at',
             'last_used_at',
         ]

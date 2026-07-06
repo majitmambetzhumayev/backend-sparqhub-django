@@ -8,13 +8,20 @@ SECRET_KEY = config('SECRET_KEY')
 DEBUG = config('DEBUG', default=False, cast=bool)
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', cast=Csv())
 
-OPENAI_API_KEY = config('OPENAI_API_KEY', default='')
 ANTHROPIC_API_KEY = config('ANTHROPIC_API_KEY', default='')
+OPENAI_API_KEY = config('OPENAI_API_KEY', default='')
+MISTRAL_API_KEY = config('MISTRAL_API_KEY', default='')
+GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
 FIELD_ENCRYPTION_KEY = config('FIELD_ENCRYPTION_KEY', default='')
+
+# Used to build absolute URLs for generated media (e.g. AI-generated images)
+# from contexts with no HTTP request object, like the WebSocket consumer.
+BACKEND_URL = config('BACKEND_URL', default='http://localhost:8000')
 
 AUTH_USER_MODEL = 'users.CustomUser'
 
 INSTALLED_APPS = [
+    'daphne',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -30,10 +37,9 @@ INSTALLED_APPS = [
     'core',
     'users',
     'assistants',
+    'projects',
     'threads',
     'chat_messages',
-    'automation',
-    'user_settings',
     'librarian',
     'keys',
     'mcp_server',
@@ -97,6 +103,9 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
+MEDIA_URL = 'media/'
+MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 

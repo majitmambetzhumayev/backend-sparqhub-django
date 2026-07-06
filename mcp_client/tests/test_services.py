@@ -1,10 +1,10 @@
 from unittest.mock import MagicMock
 from django.test import SimpleTestCase
 
-from mcp_client.services import _extract_result_text, _to_anthropic_tool
+from mcp_client.services import _extract_result_text, _to_tool_schema
 
 
-class ToAnthropicToolTest(SimpleTestCase):
+class ToToolSchemaTest(SimpleTestCase):
     def test_converts_mcp_tool_fields(self):
         mock_tool = MagicMock()
         mock_tool.name = "list_assistants"
@@ -14,7 +14,7 @@ class ToAnthropicToolTest(SimpleTestCase):
             "properties": {"user_id": {"type": "integer"}},
             "required": ["user_id"],
         }
-        result = _to_anthropic_tool(mock_tool)
+        result = _to_tool_schema(mock_tool)
         self.assertEqual(result["name"], "list_assistants")
         self.assertEqual(result["description"], "List active assistants")
         self.assertEqual(result["input_schema"], mock_tool.inputSchema)
@@ -24,7 +24,7 @@ class ToAnthropicToolTest(SimpleTestCase):
         mock_tool.name = "tool"
         mock_tool.description = None
         mock_tool.inputSchema = {"type": "object"}
-        result = _to_anthropic_tool(mock_tool)
+        result = _to_tool_schema(mock_tool)
         self.assertEqual(result["description"], "")
 
 

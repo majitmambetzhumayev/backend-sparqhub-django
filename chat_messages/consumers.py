@@ -1,55 +1,106 @@
 # chat_messages/consumers.py
+import asyncio
 import json
-from channels.generic.websocket import AsyncWebsocketConsumer
-from asgiref.sync import sync_to_async
-from ai_providers.chat_router import send_chat_message  # must support async streaming
-from threads.models    import Thread
-from chat_messages.models import Message
+import logging
 
-class QuickChatConsumer(AsyncWebsocketConsumer):
+from asgiref.sync import sync_to_async
+from channels.generic.websocket import AsyncWebsocketConsumer
+
+from ai_providers.chat_router import InsufficientCreditsError
+from chat_messages.services import stream_message
+from librarian.services import retrieve_relevant_memories
+from threads.models import Thread
+from threads.services import get_or_create_thread
+
+logger = logging.getLogger(__name__)
+
+
+class ConversationConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        # Accept connection
+        if self.scope["user"].is_anonymous:
+            await self.close(code=4001)
+            return
+        self._pending_confirmation: asyncio.Future | None = None
+        self._active_task: asyncio.Task | None = None
         await self.accept()
+
+    async def disconnect(self, close_code):
+        if self._pending_confirmation is not None and not self._pending_confirmation.done():
+            self._pending_confirmation.cancel()
+        if self._active_task is not None and not self._active_task.done():
+            self._active_task.cancel()
 
     async def receive(self, text_data):
         """
-        Expects JSON: {"assistant_id": int, "thread_id": int|null, "message": str}
-        Streams back each token as: {"chunk": "..."}
+        Expects JSON: {"thread_id": int|null, "message": str, "ai_provider"?: str, "model"?: str, "project_id"?: int}
+        `ai_provider`/`model`/`project_id` are only consulted when `thread_id` is null (creation
+        time) — an existing thread's provider/model is read fresh from the DB on every send, so a
+        PATCH to /api/threads/<id>/ takes effect on the next message with no extra wiring.
+        Streams back {"chunk": "..."} frames, then a final {"done": true, "thread_id": int}.
+
+        A turn can pause mid-stream waiting on user approval for a sensitive tool
+        (e.g. delegate_to_model): {"status": "confirm_required", "tool": ..., "arguments": ...}
+        is sent, and the client replies on the same connection with
+        {"type": "tool_confirmation", "confirmed": bool}. Since Channels dispatches
+        messages for one connection sequentially, the turn itself runs as a
+        background task so this method can return and let the confirmation frame
+        be received while the turn is paused awaiting it.
         """
         data = json.loads(text_data)
-        assistant_id = data.get("assistant_id")
-        thread_id    = data.get("thread_id")
-        message_text = data.get("message")
 
-        if not assistant_id or not message_text:
-            await self.send(json.dumps({"error":"Missing fields"}))
+        if data.get("type") == "tool_confirmation":
+            if self._pending_confirmation is not None and not self._pending_confirmation.done():
+                self._pending_confirmation.set_result(bool(data.get("confirmed")))
             return
 
-        # 1) Fetch/create thread synchronously
-        if thread_id is None:
-            thread = await sync_to_async(Thread.objects.create)(
-                user=self.scope["user"], assistant_id=assistant_id
+        self._active_task = asyncio.create_task(self._handle_chat_message(data))
+
+    async def _confirm_tool_call(self, tool_name: str, arguments: dict) -> bool:
+        self._pending_confirmation = asyncio.get_event_loop().create_future()
+        await self.send(json.dumps({"status": "confirm_required", "tool": tool_name, "arguments": arguments}))
+        try:
+            return await self._pending_confirmation
+        finally:
+            self._pending_confirmation = None
+
+    async def _handle_chat_message(self, data):
+        thread_id = data.get("thread_id")
+        message_text = data.get("message")
+        ai_provider = data.get("ai_provider")
+        model = data.get("model")
+        project_id = data.get("project_id")
+
+        if not message_text:
+            await self.send(json.dumps({"error": "Missing fields"}))
+            return
+
+        user = self.scope["user"]
+        try:
+            thread = await sync_to_async(get_or_create_thread)(
+                user, thread_id=thread_id, ai_provider=ai_provider, model=model, project_id=project_id,
             )
-        else:
-            thread = await sync_to_async(Thread.objects.get)(
-                pk=thread_id, user=self.scope["user"]
-            )
+        except Thread.DoesNotExist:
+            await self.send(json.dumps({"error": "Thread not found."}))
+            return
 
-        # 2) Save user message
-        await sync_to_async(Message.objects.create)(
-            thread=thread, sender="user", content=message_text
-        )
+        memories = await sync_to_async(retrieve_relevant_memories)(user, message_text)
 
-        # 3) Stream AI response
-        async for chunk in send_chat_message(
-            thread.assistant, message_text, stream=True
-        ):
-            # Send each token/chunk immediately
-            await self.send(json.dumps({"chunk": chunk}))
+        async def on_tool_call(tool_name):
+            await self.send(json.dumps({"status": "tool_call", "tool": tool_name}))
 
-        # 4) Save the full assistant reply
-        full_reply = ""  # accumulate if desired
-        # (you might collect chunks into full_reply here)
-        await sync_to_async(Message.objects.create)(
-            thread=thread, sender="assistant", content=full_reply
-        )
+        await self.send(json.dumps({"status": "thinking"}))
+        try:
+            async for chunk in stream_message(
+                thread, message_text, user, memories=memories,
+                on_tool_call=on_tool_call, confirm_tool_call=self._confirm_tool_call,
+            ):
+                await self.send(json.dumps({"chunk": chunk}))
+        except InsufficientCreditsError as exc:
+            await self.send(json.dumps({"error": str(exc)}))
+            return
+        except Exception:
+            logger.exception("Error while streaming chat response for thread %s", thread.id)
+            await self.send(json.dumps({"error": "Something went wrong while generating the response. Please try again."}))
+            return
+
+        await self.send(json.dumps({"done": True, "thread_id": thread.id}))

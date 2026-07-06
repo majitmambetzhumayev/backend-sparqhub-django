@@ -3,3 +3,4 @@ django-stubs[compatible-mypy]
 djangorestframework-stubs
 pytest
 pytest-django
+daphne

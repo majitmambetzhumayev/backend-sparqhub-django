@@ -1,3 +1,5 @@
+from django.conf import settings
+from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
@@ -5,18 +7,27 @@ from django.http import JsonResponse
 
 # Auth & CSRF
 from users.views import (
+    AdminUserViewSet,
     CookieTokenObtainPairView,
     CookieTokenRefreshView,
     LogoutAPIView,
     CurrentUserAPIView,
     RegisterAPIView,
 )
-from core.views import CsrfTokenView, QuickChatDataAPIView
-from threads.views import ThreadListAPIView
+from core.views import CsrfTokenView
+from threads.views import ThreadListAPIView, ThreadDetailAPIView
 
-# Assistants & API Keys viewsets
-from assistants.views import AssistantViewSet
+# Assistants viewset
+from assistants.views import AssistantViewSet, AvailableProvidersAPIView
+
+# API keys viewset
 from keys.views import APIKeyViewSet
+
+# Projects viewset
+from projects.views import ProjectViewSet
+
+# MCP servers viewset
+from mcp_client.views import MCPServerViewSet
 
 # Threading and messaging
 # chat_messages/urls.py defines:
@@ -39,22 +50,22 @@ urlpatterns += [
     path('api/csrf/',          CsrfTokenView.as_view(),            name='csrf'),
 ]
 
-# Quick-Chat metadata endpoint
-urlpatterns += [
-    path('api/quick-chat/', QuickChatDataAPIView.as_view(), name='quick-chat'),
-]
-
-# Thread list
+# Thread list & detail
 urlpatterns += [
     path('api/threads/', ThreadListAPIView.as_view(), name='thread-list'),
+    path('api/threads/<int:pk>/', ThreadDetailAPIView.as_view(), name='thread-detail'),
 ]
 
 # Main API router for viewsets
 router = DefaultRouter()
 router.register('assistants', AssistantViewSet, basename='assistant')
-router.register('apikeys',    APIKeyViewSet,    basename='apikey')
+router.register('apikeys', APIKeyViewSet, basename='apikey')
+router.register('projects', ProjectViewSet, basename='project')
+router.register('mcp-servers', MCPServerViewSet, basename='mcpserver')
+router.register('admin/users', AdminUserViewSet, basename='admin-user')
 urlpatterns += [
     path('api/', include(router.urls)),
+    path('api/providers/', AvailableProvidersAPIView.as_view(), name='providers'),
 ]
 
 # Chat messages URLs (nested under /api/)
@@ -74,3 +85,6 @@ def healthcheck(request):
 urlpatterns += [
     path('api/healthcheck/', healthcheck, name='healthcheck'),
 ]
+
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

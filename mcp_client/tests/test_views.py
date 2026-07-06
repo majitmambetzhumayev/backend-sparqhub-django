@@ -1,0 +1,101 @@
+from django.urls import reverse
+from rest_framework.test import APITestCase
+from rest_framework import status
+from django.contrib.auth import get_user_model
+from projects.models import Project
+from mcp_client.models import MCPServer
+
+User = get_user_model()
+
+
+class MCPServerCRUDAPITest(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='mcpuser', password='pass')
+        self.client.force_authenticate(user=self.user)
+        self.project = Project.objects.create(user=self.user, name="Research")
+        self.url = reverse('mcpserver-list')
+
+    def test_create_stdio_server(self):
+        response = self.client.post(self.url, data={
+            "project": self.project.id,
+            "name": "Local tools",
+            "transport": "stdio",
+            "command": "python",
+            "args": ["-m", "my_tool_server"],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["name"], "Local tools")
+        self.assertTrue(response.data["enabled"])
+
+    def test_create_sse_server(self):
+        response = self.client.post(self.url, data={
+            "project": self.project.id,
+            "name": "Remote tools",
+            "transport": "sse",
+            "url": "https://example.com/mcp",
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_stdio_without_command_rejected(self):
+        response = self.client.post(self.url, data={
+            "project": self.project.id,
+            "name": "Broken",
+            "transport": "stdio",
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("command", response.data)
+
+    def test_sse_without_url_rejected(self):
+        response = self.client.post(self.url, data={
+            "project": self.project.id,
+            "name": "Broken",
+            "transport": "sse",
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("url", response.data)
+
+    def test_cannot_attach_server_to_another_users_project(self):
+        other_user = User.objects.create_user(username='otheruser', password='pass')
+        other_project = Project.objects.create(user=other_user, name="Not yours")
+
+        response = self.client.post(self.url, data={
+            "project": other_project.id,
+            "name": "Snooping",
+            "transport": "stdio",
+            "command": "python",
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_list_filters_by_project_id(self):
+        other_project = Project.objects.create(user=self.user, name="Other")
+        MCPServer.objects.create(project=self.project, name="A", transport="stdio", command="python")
+        MCPServer.objects.create(project=other_project, name="B", transport="stdio", command="python")
+
+        response = self.client.get(self.url, {"project_id": self.project.id})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["name"], "A")
+
+    def test_toggle_enabled(self):
+        server = MCPServer.objects.create(project=self.project, name="A", transport="stdio", command="python")
+        detail_url = reverse('mcpserver-detail', kwargs={'pk': server.id})
+
+        response = self.client.patch(detail_url, data={"enabled": False}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["enabled"])
+
+    def test_delete_server(self):
+        server = MCPServer.objects.create(project=self.project, name="A", transport="stdio", command="python")
+        detail_url = reverse('mcpserver-detail', kwargs={'pk': server.id})
+
+        response = self.client.delete(detail_url)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(MCPServer.objects.filter(pk=server.id).exists())
+
+    def test_cannot_access_another_users_server(self):
+        other_user = User.objects.create_user(username='otheruser', password='pass')
+        other_project = Project.objects.create(user=other_user, name="Not yours")
+        server = MCPServer.objects.create(project=other_project, name="A", transport="stdio", command="python")
+        detail_url = reverse('mcpserver-detail', kwargs={'pk': server.id})
+
+        self.assertEqual(self.client.get(detail_url).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.client.delete(detail_url).status_code, status.HTTP_404_NOT_FOUND)

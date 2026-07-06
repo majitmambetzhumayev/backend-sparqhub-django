@@ -16,12 +16,11 @@ class CustomUser(AbstractUser):
         max_length=20,
         choices=(
             ('anthropic', 'Anthropic'),
-            ('openai', 'OpenAI'),
-            ('mistral', 'Mistral'),
         ),
         default='anthropic',
     )
     phone_number = models.CharField(max_length=20, blank=True, null=True)
+    credits_remaining = models.IntegerField(default=100)
 
     # Override the built-in m2m fields:
     groups = models.ManyToManyField(
