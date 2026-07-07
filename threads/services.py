@@ -51,14 +51,14 @@ def update_thread_provider(thread: Thread, ai_provider: str, model: str) -> Thre
 async def generate_and_store_title(thread: Thread, user_text: str, assistant_text: str) -> None:
     from types import SimpleNamespace
     from keys.services import get_user_api_key
-    from ai_providers.factory import get_provider
+    from ai_providers.factory import provider_session
 
     key_record = await get_user_api_key(thread.user, thread.ai_provider)
     api_key = key_record.encrypted_key if key_record else None
-    provider = get_provider(thread.ai_provider, api_key=api_key)
     turn = SimpleNamespace(model=thread.model, instructions="")
     messages = [{"role": "user", "content": f"User: {user_text}\nAssistant: {assistant_text}"}]
-    response = await provider.complete(turn, messages, _TITLE_SYSTEM_PROMPT, None)
+    async with provider_session(thread.ai_provider, api_key=api_key) as provider:
+        response = await provider.complete(turn, messages, _TITLE_SYSTEM_PROMPT, None)
     title = response.text.strip().strip('"').strip("'")[:100]
     if title:
         await sync_to_async(Thread.objects.filter(pk=thread.pk).update)(title=title)

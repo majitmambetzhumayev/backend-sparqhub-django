@@ -29,6 +29,14 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def _mock_provider(**kwargs) -> MagicMock:
+    """A MagicMock provider with an awaitable aclose() — send_chat_message
+    always calls it, and a plain MagicMock's aclose() isn't awaitable."""
+    provider = MagicMock(**kwargs)
+    provider.aclose = AsyncMock()
+    return provider
+
+
 class ComputeCostCreditsTest(TransactionTestCase):
     def test_zero_when_no_usage(self):
         self.assertEqual(_compute_cost_credits(AnthropicProvider, 'claude-sonnet-5', None), 0)
@@ -92,7 +100,7 @@ class SendChatMessageCreditsGateTest(TransactionTestCase):
     @patch('keys.services.get_user_api_key', new_callable=AsyncMock)
     def test_does_not_block_when_personal_key_present(self, mock_get_key, mock_run_loop, mock_get_provider):
         mock_get_key.return_value = MagicMock(encrypted_key='sk-personal')
-        mock_get_provider.return_value = MagicMock()
+        mock_get_provider.return_value = _mock_provider()
 
         result, usage, used_global_key = run(send_chat_message(
             self.assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user,
@@ -114,7 +122,7 @@ class SendChatMessageCreditsGateTest(TransactionTestCase):
         assistant = Assistant.objects.create(
             user=user, name='A', instructions='Be helpful.', ai_provider='anthropic',
         )
-        mock_get_provider.return_value = MagicMock()
+        mock_get_provider.return_value = _mock_provider()
 
         run(send_chat_message(assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=user))
 
@@ -281,7 +289,7 @@ class SendChatMessageImageToolTest(TransactionTestCase):
         assistant = Assistant.objects.create(
             user=self.user, name='A', instructions='Be helpful.', ai_provider='openai',
         )
-        mock_get_provider.return_value = MagicMock()
+        mock_get_provider.return_value = _mock_provider()
         mock_get_image_provider.return_value = MagicMock()
 
         run(send_chat_message(assistant, 'Hello', ai_provider='openai', model='gpt-5.4', user=self.user))
@@ -296,7 +304,7 @@ class SendChatMessageImageToolTest(TransactionTestCase):
         assistant = Assistant.objects.create(
             user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
         )
-        mock_get_provider.return_value = MagicMock()
+        mock_get_provider.return_value = _mock_provider()
 
         run(send_chat_message(assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user))
 
@@ -423,7 +431,7 @@ class SendChatMessageDelegateToolTest(TransactionTestCase):
         assistant = Assistant.objects.create(
             user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
         )
-        mock_get_provider.return_value = MagicMock()
+        mock_get_provider.return_value = _mock_provider()
 
         run(send_chat_message(assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user))
 
@@ -437,7 +445,7 @@ class SendChatMessageDelegateToolTest(TransactionTestCase):
         assistant = Assistant.objects.create(
             user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
         )
-        mock_get_provider.return_value = MagicMock()
+        mock_get_provider.return_value = _mock_provider()
 
         run(send_chat_message(
             assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user,
@@ -446,3 +454,54 @@ class SendChatMessageDelegateToolTest(TransactionTestCase):
 
         tool_names = [t['name'] for t in mock_run_loop.call_args.args[4]]
         self.assertNotIn('delegate_to_model', tool_names)
+
+
+class SendChatMessageProviderCleanupTest(TransactionTestCase):
+    # Regression tests: a provider's aclose() must run once send_chat_message
+    # is truly done with it — immediately for the non-streaming path, but not
+    # until the caller has fully drained the stream for the streaming path
+    # (closing it earlier would kill the connection mid-response).
+    def setUp(self):
+        self.user = User.objects.create_user(username='cleanupuser', password='pass', credits_remaining=100)
+        self.assistant = Assistant.objects.create(
+            user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
+        )
+
+    @patch('ai_providers.chat_router.get_provider')
+    @patch('ai_providers.chat_router.run_agent_loop', new_callable=AsyncMock, return_value='Hi there!')
+    @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
+    def test_closes_provider_after_non_streaming_turn(self, mock_get_key, mock_run_loop, mock_get_provider):
+        provider = _mock_provider()
+        mock_get_provider.return_value = provider
+
+        run(send_chat_message(
+            self.assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user,
+        ))
+
+        provider.aclose.assert_awaited_once()
+
+    @patch('ai_providers.chat_router.get_provider')
+    @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
+    def test_defers_closing_provider_until_stream_is_drained(self, mock_get_key, mock_get_provider):
+        provider = _mock_provider()
+
+        async def fake_stream(*args, **kwargs):
+            yield "Hel"
+            yield "lo!"
+
+        provider.stream = fake_stream
+        mock_get_provider.return_value = provider
+
+        async def scenario():
+            result, _usage, _used_global_key = await send_chat_message(
+                self.assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user,
+                stream=True,
+            )
+            provider.aclose.assert_not_awaited()
+
+            chunks = [chunk async for chunk in result]
+
+            self.assertEqual(chunks, ["Hel", "lo!"])
+            provider.aclose.assert_awaited_once()
+
+        run(scenario())

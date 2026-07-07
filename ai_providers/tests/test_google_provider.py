@@ -58,6 +58,15 @@ class GeminiProviderCompleteTest(SimpleTestCase):
         self.assertEqual(result.text, 'Hello!')
         self.assertFalse(result.requires_tool_execution)
 
+    def test_aclose_closes_the_underlying_async_client(self):
+        # Regression test: the genai SDK's async httpx client outlives a
+        # single call if never closed explicitly, and garbage-collecting it
+        # later — after a short-lived event loop (e.g. a Celery task run via
+        # async_to_sync) has already closed — raises "Event loop is closed".
+        self.provider.client.aio.aclose = AsyncMock()
+        run(self.provider.aclose())
+        self.provider.client.aio.aclose.assert_awaited_once()
+
     def test_complete_renames_assistant_role_to_model(self):
         self.provider.client.aio.models.generate_content = AsyncMock(return_value=_make_response(text='OK'))
         run(self.provider.complete(

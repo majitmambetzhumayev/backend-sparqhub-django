@@ -1,5 +1,6 @@
 # ai_providers/tests/test_factory.py
-from unittest.mock import patch
+import asyncio
+from unittest.mock import AsyncMock, patch
 
 from django.test import SimpleTestCase
 
@@ -7,7 +8,11 @@ from ai_providers.anthropic.anthropic_provider import AnthropicProvider
 from ai_providers.openai.openai_provider import OpenAIProvider
 from ai_providers.mistral.mistral_provider import MistralProvider
 from ai_providers.google.google_provider import GeminiProvider
-from ai_providers.factory import PROVIDERS, get_provider
+from ai_providers.factory import PROVIDERS, get_provider, provider_session
+
+
+def run(coro):
+    return asyncio.run(coro)
 
 
 class ProviderFactoryTest(SimpleTestCase):
@@ -61,3 +66,33 @@ class ProviderFactoryTest(SimpleTestCase):
         with patch("ai_providers.google.google_provider.genai.Client") as mock_client:
             get_provider("gemini", api_key="sk-personal-key")
         mock_client.assert_called_once_with(api_key="sk-personal-key")
+
+
+class ProviderSessionTest(SimpleTestCase):
+    # Regression tests for the async_to_sync + Gemini "Event loop is closed"
+    # bug: a provider created inside a short-lived event loop (a Celery task
+    # via async_to_sync) must be explicitly closed before that loop tears
+    # down, not left for garbage collection to close later on a dead loop.
+
+    def test_closes_provider_after_successful_use(self):
+        async def scenario():
+            with patch("ai_providers.factory.get_provider") as mock_get_provider:
+                provider = AsyncMock()
+                mock_get_provider.return_value = provider
+                async with provider_session("gemini", api_key="k") as p:
+                    self.assertIs(p, provider)
+                provider.aclose.assert_awaited_once()
+
+        run(scenario())
+
+    def test_closes_provider_even_if_the_block_raises(self):
+        async def scenario():
+            with patch("ai_providers.factory.get_provider") as mock_get_provider:
+                provider = AsyncMock()
+                mock_get_provider.return_value = provider
+                with self.assertRaises(ValueError):
+                    async with provider_session("gemini", api_key="k"):
+                        raise ValueError("boom")
+                provider.aclose.assert_awaited_once()
+
+        run(scenario())
