@@ -2,6 +2,7 @@ anthropic
 celery
 channels
 channels-redis
+daphne
 django
 django-cors-headers
 django-encrypted-model-fields

@@ -1,0 +1,15 @@
+.env
+.env.*
+.git
+.github
+venv
+__pycache__
+*.pyc
+.pytest_cache
+staticfiles
+media
+NOTES.md
+REVIEW.md
+to_remove.txt
+Dockerfile.dev
+docker-compose*.yml
