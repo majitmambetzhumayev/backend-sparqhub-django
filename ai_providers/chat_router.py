@@ -230,6 +230,18 @@ async def deduct_credits(user, ai_provider: str, model: str, usage: UsageAccumul
         await sync_to_async(_apply_credit_deduction)(user, cost)
 
 
+async def _stream_and_release(provider, chunks):
+    """Wraps a provider's stream so aclose() runs once the caller has fully
+    drained it (or aborted early) — the provider has to stay open until then,
+    unlike the non-streaming path where send_chat_message can close it itself
+    before returning."""
+    try:
+        async for chunk in chunks:
+            yield chunk
+    finally:
+        await provider.aclose()
+
+
 async def send_chat_message(
     assistant,
     message_text: str,
@@ -265,40 +277,49 @@ async def send_chat_message(
 
     try:
         provider = get_provider(ai_provider, api_key=api_key)
-        system = _build_system_prompt(assistant.instructions, memories or [])
-        messages = [*(conversation_history or []), {"role": "user", "content": message_text}]
-        tools, mcp_executor = await _get_mcp_context(project_id)
+        provider_handed_off = False
+        try:
+            system = _build_system_prompt(assistant.instructions, memories or [])
+            messages = [*(conversation_history or []), {"role": "user", "content": message_text}]
+            tools, mcp_executor = await _get_mcp_context(project_id)
 
-        usage = UsageAccumulator()
-        image_tool, image_executor = _build_image_tool(ai_provider, api_key, user, used_global_key, usage)
-        if image_tool is not None:
-            tools = [*tools, image_tool]
+            usage = UsageAccumulator()
+            image_tool, image_executor = _build_image_tool(ai_provider, api_key, user, used_global_key, usage)
+            if image_tool is not None:
+                tools = [*tools, image_tool]
 
-        if allow_delegation:
-            delegate_tool, delegate_executor = _build_delegate_tool(user, confirm_tool_call)
-            tools = [*tools, delegate_tool]
-        else:
-            delegate_tool, delegate_executor = None, None
+            if allow_delegation:
+                delegate_tool, delegate_executor = _build_delegate_tool(user, confirm_tool_call)
+                tools = [*tools, delegate_tool]
+            else:
+                delegate_tool, delegate_executor = None, None
 
-        async def combined_executor(name: str, arguments: dict) -> str:
-            if image_tool is not None and name == "generate_image":
-                return await image_executor(arguments)
-            if delegate_tool is not None and name == "delegate_to_model":
-                return await delegate_executor(arguments)
-            if mcp_executor is not None:
-                return await mcp_executor(name, arguments)
-            raise ValueError(f"Unknown tool: {name}")
+            async def combined_executor(name: str, arguments: dict) -> str:
+                if image_tool is not None and name == "generate_image":
+                    return await image_executor(arguments)
+                if delegate_tool is not None and name == "delegate_to_model":
+                    return await delegate_executor(arguments)
+                if mcp_executor is not None:
+                    return await mcp_executor(name, arguments)
+                raise ValueError(f"Unknown tool: {name}")
 
-        tool_executor = combined_executor if tools else None
+            tool_executor = combined_executor if tools else None
 
-        turn = SimpleNamespace(model=model, instructions=assistant.instructions)
-        if stream:
-            result = provider.stream(turn, messages, system, tools, tool_executor, usage=usage, on_tool_call=on_tool_call)
-        else:
-            result = await run_agent_loop(
-                provider, turn, messages, system, tools, tool_executor, usage=usage, on_tool_call=on_tool_call,
-            )
-        return result, usage, used_global_key
+            turn = SimpleNamespace(model=model, instructions=assistant.instructions)
+            if stream:
+                chunks = provider.stream(turn, messages, system, tools, tool_executor, usage=usage, on_tool_call=on_tool_call)
+                # _stream_and_release takes over closing the provider once the
+                # caller drains it — it must stay open until then.
+                result = _stream_and_release(provider, chunks)
+                provider_handed_off = True
+            else:
+                result = await run_agent_loop(
+                    provider, turn, messages, system, tools, tool_executor, usage=usage, on_tool_call=on_tool_call,
+                )
+            return result, usage, used_global_key
+        finally:
+            if not provider_handed_off:
+                await provider.aclose()
     except Exception:
         logger.exception("Error during chat dispatch")
         raise

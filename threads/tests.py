@@ -259,6 +259,7 @@ class GenerateAndStoreTitleTest(APITransactionTestCase):
     def test_stores_generated_title(self, mock_get_provider, mock_get_key):
         provider = MagicMock()
         provider.complete = AsyncMock(return_value=ProviderResponse(text='Weather Chat', tool_calls=[]))
+        provider.aclose = AsyncMock()
         mock_get_provider.return_value = provider
 
         run(generate_and_store_title(self.thread, "What's the weather?", "Sunny today."))
@@ -271,6 +272,7 @@ class GenerateAndStoreTitleTest(APITransactionTestCase):
     def test_strips_quotes_from_generated_title(self, mock_get_provider, mock_get_key):
         provider = MagicMock()
         provider.complete = AsyncMock(return_value=ProviderResponse(text='"Weather Chat"', tool_calls=[]))
+        provider.aclose = AsyncMock()
         mock_get_provider.return_value = provider
 
         run(generate_and_store_title(self.thread, "hi", "hello"))
@@ -285,6 +287,7 @@ class GenerateAndStoreTitleTest(APITransactionTestCase):
         self.thread.save(update_fields=["title"])
         provider = MagicMock()
         provider.complete = AsyncMock(return_value=ProviderResponse(text='   ', tool_calls=[]))
+        provider.aclose = AsyncMock()
         mock_get_provider.return_value = provider
 
         run(generate_and_store_title(self.thread, "hi", "hello"))

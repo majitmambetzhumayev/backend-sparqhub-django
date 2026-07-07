@@ -15,12 +15,13 @@ def run(coro):
 class ExtractAndStoreMemoriesTest(SimpleTestCase):
     @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
     @patch('librarian.services.store_memory')
-    @patch('librarian.services.get_provider')
+    @patch('ai_providers.factory.get_provider')
     def test_stores_one_entry_per_extracted_fact(self, mock_get_provider, mock_store_memory, mock_get_key):
         provider = MagicMock()
         provider.complete = AsyncMock(return_value=ProviderResponse(
             text="Allergic to peanuts.\nWorks as a data scientist.", tool_calls=[],
         ))
+        provider.aclose = AsyncMock()
         mock_get_provider.return_value = provider
         user = MagicMock()
         assistant = MagicMock(ai_provider='anthropic')
@@ -35,10 +36,11 @@ class ExtractAndStoreMemoriesTest(SimpleTestCase):
 
     @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
     @patch('librarian.services.store_memory')
-    @patch('librarian.services.get_provider')
+    @patch('ai_providers.factory.get_provider')
     def test_none_response_stores_nothing(self, mock_get_provider, mock_store_memory, mock_get_key):
         provider = MagicMock()
         provider.complete = AsyncMock(return_value=ProviderResponse(text="NONE", tool_calls=[]))
+        provider.aclose = AsyncMock()
         mock_get_provider.return_value = provider
 
         run(extract_and_store_memories(MagicMock(), MagicMock(ai_provider='anthropic'), "hey", "hi there"))

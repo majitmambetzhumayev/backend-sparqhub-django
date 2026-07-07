@@ -49,6 +49,16 @@ class AIProviderBase:
     """
 
     label: str = ""
+
+    async def aclose(self) -> None:
+        """Release any resources this instance holds open (e.g. a persistent
+        async HTTP client). No-op by default — override only if the
+        underlying SDK actually needs it. A fresh provider is constructed per
+        turn, and some SDKs (Gemini's) hold an async client that outlives the
+        call if never closed; garbage-collecting it later, after a short-lived
+        event loop (e.g. a Celery task run via async_to_sync) has already
+        closed, raises "Event loop is closed" from the finalizer."""
+
     AVAILABLE_MODELS: list[dict] = []
 
     async def complete(self, assistant, messages, system, tools) -> ProviderResponse:

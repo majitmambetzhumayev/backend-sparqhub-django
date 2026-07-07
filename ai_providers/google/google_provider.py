@@ -37,6 +37,9 @@ class GeminiProvider(AIProviderBase):
         # position 2", from a second round-trip overwriting the first's entry).
         self._call_counter = 0
 
+    async def aclose(self) -> None:
+        await self.client.aio.aclose()
+
     @staticmethod
     def _to_part(part: dict) -> "types.Part":
         if "text" in part:

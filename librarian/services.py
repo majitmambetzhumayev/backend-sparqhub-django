@@ -4,7 +4,7 @@ from asgiref.sync import sync_to_async
 from pgvector.django import CosineDistance
 from sentence_transformers import SentenceTransformer
 
-from ai_providers.factory import get_provider
+from ai_providers.factory import provider_session
 
 from .models import MemoryEntry
 
@@ -48,9 +48,9 @@ async def extract_and_store_memories(user, assistant, user_text: str, assistant_
 
     key_record = await get_user_api_key(user, assistant.ai_provider)
     api_key = key_record.encrypted_key if key_record else None
-    provider = get_provider(assistant.ai_provider, api_key=api_key)
     messages = [{"role": "user", "content": f"User: {user_text}\nAssistant: {assistant_text}"}]
-    response = await provider.complete(assistant, messages, _EXTRACTION_SYSTEM_PROMPT, None)
+    async with provider_session(assistant.ai_provider, api_key=api_key) as provider:
+        response = await provider.complete(assistant, messages, _EXTRACTION_SYSTEM_PROMPT, None)
     for line in response.text.splitlines():
         fact = line.strip()
         if fact and fact.upper() != "NONE":
