@@ -1,6 +1,7 @@
 from pathlib import Path
 from datetime import timedelta
 from decouple import config, Csv
+import sentry_sdk
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -13,6 +14,26 @@ OPENAI_API_KEY = config('OPENAI_API_KEY', default='')
 MISTRAL_API_KEY = config('MISTRAL_API_KEY', default='')
 GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
 FIELD_ENCRYPTION_KEY = config('FIELD_ENCRYPTION_KEY', default='')
+
+# Blank in an environment with no Sentry project configured (e.g. CI) just
+# means the SDK stays uninitialized — no crash reporting, not a hard error.
+SENTRY_DSN = config('SENTRY_DSN', default='')
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        environment='development' if DEBUG else 'production',
+        # No IPs/request headers/user data sent — this app handles chat
+        # conversations, and that's more than crash reporting needs.
+        send_default_pii=False,
+        # Routine application logs (logger.info/.warning) stay local via the
+        # LOGGING config below; Sentry only sees unhandled exceptions and
+        # explicit logger.exception()/error() calls, which the SDK captures
+        # as issues regardless of this flag.
+        enable_logs=False,
+        traces_sample_rate=1.0,
+        profile_session_sample_rate=1.0,
+        profile_lifecycle="trace",
+    )
 
 # Used to build absolute URLs for generated media (e.g. AI-generated images)
 # from contexts with no HTTP request object, like the WebSocket consumer.

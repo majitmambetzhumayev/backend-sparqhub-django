@@ -16,5 +16,6 @@ pgvector
 psycopg2-binary
 python-decouple
 sentence-transformers
+sentry-sdk
 uvicorn[standard]
 whitenoise
