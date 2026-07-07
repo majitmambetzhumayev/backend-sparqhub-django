@@ -88,3 +88,11 @@ urlpatterns += [
 
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+    # Dev-only: hit this to confirm Sentry is actually receiving events.
+    # Gated behind DEBUG so it can never ship as a live, unauthenticated
+    # crash-on-demand endpoint.
+    def _sentry_debug(request):
+        1 / 0
+
+    urlpatterns += [path('sentry-debug/', _sentry_debug)]
