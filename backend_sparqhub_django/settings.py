@@ -54,6 +54,7 @@ INSTALLED_APPS = [
     'channels',
     'corsheaders',
     'encrypted_model_fields',
+    'storages',
     'pgvector.django',
     'core',
     'users',
@@ -123,10 +124,32 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 MEDIA_URL = 'media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# Generated images (image_providers) go to Cloudflare R2 (S3-compatible) when
+# configured; local disk otherwise (dev, CI, or before R2 is set up) — local
+# disk is ephemeral on most hosting platforms, wiped on every deploy/restart.
+AWS_ACCESS_KEY_ID = config('R2_ACCESS_KEY_ID', default='')
+AWS_SECRET_ACCESS_KEY = config('R2_SECRET_ACCESS_KEY', default='')
+AWS_STORAGE_BUCKET_NAME = config('R2_BUCKET_NAME', default='')
+AWS_S3_ENDPOINT_URL = config('R2_ENDPOINT_URL', default='')
+AWS_S3_CUSTOM_DOMAIN = config('R2_PUBLIC_DOMAIN', default='')
+AWS_S3_REGION_NAME = 'auto'
+AWS_S3_SIGNATURE_VERSION = 's3v4'
+AWS_S3_ADDRESSING_STYLE = 'virtual'
+AWS_DEFAULT_ACL = None
+AWS_QUERYSTRING_AUTH = False
+
+STORAGES = {
+    'default': {
+        'BACKEND': 'storages.backends.s3.S3Storage' if AWS_ACCESS_KEY_ID else 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 

@@ -6,6 +6,7 @@ daphne
 django
 django-cors-headers
 django-encrypted-model-fields
+django-storages[s3]
 djangorestframework
 djangorestframework-simplejwt
 google-genai

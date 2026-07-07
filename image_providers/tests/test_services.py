@@ -1,5 +1,6 @@
 import shutil
 import tempfile
+from unittest.mock import patch
 
 from django.test import SimpleTestCase, override_settings
 
@@ -35,3 +36,12 @@ class SaveGeneratedImageTest(SimpleTestCase):
         relative_path = url.split('/media/', 1)[1]
         with default_storage.open(relative_path) as f:
             self.assertEqual(f.read(), b'exact-content')
+
+    def test_returns_remote_storage_url_unprefixed(self):
+        # Regression test: a remote backend (R2/S3, once R2_* env vars are
+        # set) already returns a fully-qualified URL via .url() — it must be
+        # returned as-is, not prefixed with BACKEND_URL a second time.
+        remote_url = 'https://pub-example.r2.dev/generated_images/x.png'
+        with patch('image_providers.services.default_storage.url', return_value=remote_url):
+            url = save_generated_image(b'fake-bytes', 'image/png')
+        self.assertEqual(url, remote_url)
