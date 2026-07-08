@@ -2,7 +2,7 @@ import asyncio
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
-from django.test import TransactionTestCase
+from django.test import TransactionTestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APITestCase
 from rest_framework import status
@@ -47,6 +47,38 @@ class JWTAuthMiddlewareTest(TransactionTestCase):
 
     def test_invalid_token_resolves_anonymous(self):
         self.assertIsInstance(self._resolved_user("access_token=garbage"), AnonymousUser)
+
+
+class AuthCookieDomainTest(APITestCase):
+    # Regression tests: a cookie set with no `domain` is host-only (scoped
+    # exactly to the host that set it) and is never sent to a sibling
+    # subdomain, even one that's "same-site" for SameSite-cookie purposes.
+    # COOKIE_DOMAIN must actually reach the Set-Cookie header in prod, or the
+    # frontend's own server-side auth check (reading this cookie on its own
+    # domain) never sees it and the user gets bounced back to login forever.
+    def setUp(self):
+        User.objects.create_user(username="cookieuser", password="pass")
+
+    def test_cookies_are_host_only_by_default(self):
+        response = self.client.post(reverse('auth-login'), {"username": "cookieuser", "password": "pass"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.cookies['access_token']['domain'], '')
+        self.assertEqual(response.cookies['refresh_token']['domain'], '')
+
+    @override_settings(COOKIE_DOMAIN='.sparqup.fr')
+    def test_cookies_get_shared_parent_domain_when_configured(self):
+        response = self.client.post(reverse('auth-login'), {"username": "cookieuser", "password": "pass"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.cookies['access_token']['domain'], '.sparqup.fr')
+        self.assertEqual(response.cookies['refresh_token']['domain'], '.sparqup.fr')
+
+    @override_settings(COOKIE_DOMAIN='.sparqup.fr')
+    def test_logout_clears_cookies_on_the_same_domain_they_were_set_with(self):
+        response = self.client.post(reverse('auth-logout'))
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(response.cookies['access_token']['domain'], '.sparqup.fr')
+        self.assertEqual(response.cookies['refresh_token']['domain'], '.sparqup.fr')
+        self.assertEqual(response.cookies['sessionid']['domain'], '.sparqup.fr')
 
 
 class AdminUserViewSetTest(APITestCase):
