@@ -45,6 +45,11 @@ FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000')
 RESEND_API_KEY = config('RESEND_API_KEY', default='')
 DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='noreply@sparqup.fr')
 
+GOOGLE_OAUTH_CLIENT_ID = config('GOOGLE_OAUTH_CLIENT_ID', default='')
+GOOGLE_OAUTH_CLIENT_SECRET = config('GOOGLE_OAUTH_CLIENT_SECRET', default='')
+GITHUB_OAUTH_CLIENT_ID = config('GITHUB_OAUTH_CLIENT_ID', default='')
+GITHUB_OAUTH_CLIENT_SECRET = config('GITHUB_OAUTH_CLIENT_SECRET', default='')
+
 AUTH_USER_MODEL = 'users.CustomUser'
 
 INSTALLED_APPS = [
