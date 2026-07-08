@@ -10,8 +10,9 @@ class MemoryEntry(models.Model):
         related_name='memories',
     )
     content = models.TextField()
-    # 384-dim matches all-MiniLM-L6-v2
-    embedding = VectorField(dimensions=384)
+    # 1024-dim matches Mistral's mistral-embed (doesn't support output_dimension
+    # truncation — confirmed via a live API call, its docs are ambiguous on this)
+    embedding = VectorField(dimensions=1024)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
