@@ -17,6 +17,7 @@ openai
 pgvector
 psycopg2-binary
 python-decouple
+resend
 sentry-sdk
 uvicorn[standard]
 whitenoise
