@@ -426,8 +426,9 @@ class SendMessageAPICreditsTest(APITestCase):
         self.user = User.objects.create_user(username="apiuser", password="pass")
         self.client.force_authenticate(user=self.user)
 
+    @patch("chat_messages.views.retrieve_relevant_memories", return_value=[])
     @patch("chat_messages.views.send_message", new_callable=AsyncMock)
-    def test_returns_402_on_insufficient_credits(self, mock_send):
+    def test_returns_402_on_insufficient_credits(self, mock_send, mock_memories):
         mock_send.side_effect = InsufficientCreditsError("Crédit épuisé.")
 
         response = self.client.post(reverse('message-list-create-thread'), {"message": "Hi"}, format='json')
