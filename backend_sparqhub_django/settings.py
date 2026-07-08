@@ -172,9 +172,20 @@ CHANNEL_LAYERS = {
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = config('CORS_ALLOWED_ORIGINS', cast=Csv())
 CSRF_TRUSTED_ORIGINS = config('CORS_ALLOWED_ORIGINS', cast=Csv())
+
+# Blank (the default) means host-only cookies — correct for local dev, where
+# the frontend/backend hosts (localhost:3000/8000) share no parent domain to
+# scope to. In prod, where frontend and backend live on sibling subdomains of
+# the same domain (e.g. app.example.com / api.example.com), this must be set
+# to the shared parent (e.g. ".example.com") — otherwise a cookie set by the
+# backend is host-only to its own domain and never sent to the frontend's,
+# even though both are "same-site" for SameSite-cookie purposes.
+COOKIE_DOMAIN = config('COOKIE_DOMAIN', default='') or None
+
 CSRF_COOKIE_HTTPONLY = False
 CSRF_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_DOMAIN = COOKIE_DOMAIN
 SESSION_COOKIE_HTTPONLY = True
 
 SIMPLE_JWT = {

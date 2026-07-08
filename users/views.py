@@ -13,10 +13,11 @@ from .serializers import AdminUserSerializer, UserRegisterSerializer, CurrentUse
 
 
 def _set_auth_cookies(response, access, refresh=None):
-    secure = not settings.DEBUG 
-    response.set_cookie('access_token', access, max_age=900, httponly=True, secure=secure, samesite='Lax', path='/')
+    secure = not settings.DEBUG
+    domain = settings.COOKIE_DOMAIN
+    response.set_cookie('access_token', access, max_age=900, httponly=True, secure=secure, samesite='Lax', path='/', domain=domain)
     if refresh:
-        response.set_cookie('refresh_token', refresh, max_age=86400, httponly=True, secure=secure, samesite='Lax', path='/')
+        response.set_cookie('refresh_token', refresh, max_age=86400, httponly=True, secure=secure, samesite='Lax', path='/', domain=domain)
 
 
 @method_decorator(ensure_csrf_cookie, name='dispatch')
@@ -61,9 +62,13 @@ class LogoutAPIView(APIView):
 
     def post(self, request):
         response = Response(status=status.HTTP_204_NO_CONTENT)
-        response.delete_cookie('access_token', path='/')
-        response.delete_cookie('refresh_token', path='/')
-        response.delete_cookie('sessionid', path='/')
+        # delete_cookie must be called with the same domain the cookie was
+        # originally set with, or the browser treats it as a different
+        # cookie and the real one never actually gets cleared.
+        domain = settings.COOKIE_DOMAIN
+        response.delete_cookie('access_token', path='/', domain=domain)
+        response.delete_cookie('refresh_token', path='/', domain=domain)
+        response.delete_cookie('sessionid', path='/', domain=domain)
         return response
 
 
