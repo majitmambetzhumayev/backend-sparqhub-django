@@ -32,6 +32,11 @@ class CustomUser(AbstractUser):
     # registrations always require a real one (enforced at the serializer
     # level, not here).
     email = models.EmailField(unique=True, null=True, blank=True, default=None)
+    # Gates login (see CookieTokenObtainPairView) once a user has a real
+    # email. Backfilled to True for pre-existing accounts in migration 0009
+    # so this doesn't lock anyone out retroactively — only new registrations
+    # are actually gated by this.
+    email_verified = models.BooleanField(default=False)
 
     objects = CustomUserManager()
     bio = models.TextField(blank=True, null=True)

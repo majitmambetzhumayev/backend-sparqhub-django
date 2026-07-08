@@ -4,6 +4,8 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
 from django.contrib.auth.tokens import default_token_generator
+
+from users.services import email_confirmation_token_generator
 from django.test import TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils.encoding import force_bytes
@@ -61,7 +63,7 @@ class AuthCookieDomainTest(APITestCase):
     # frontend's own server-side auth check (reading this cookie on its own
     # domain) never sees it and the user gets bounced back to login forever.
     def setUp(self):
-        User.objects.create_user(username="cookieuser", password="pass")
+        User.objects.create_user(username="cookieuser", password="pass", email_verified=True)
 
     def test_cookies_are_host_only_by_default(self):
         response = self.client.post(reverse('auth-login'), {"username": "cookieuser", "password": "pass"})
@@ -99,12 +101,37 @@ class RegistrationEmailTest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('email', response.data)
 
-    def test_registration_succeeds_with_unique_email(self):
+    @patch('users.services.send_email_task')
+    def test_registration_succeeds_with_unique_email(self, mock_task):
         response = self.client.post(reverse('auth-register'), {
             "username": "newuser", "password": "pass12345", "email": "new@example.com",
         })
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(User.objects.get(username="newuser").email, "new@example.com")
+
+    @patch('users.services.send_email_task')
+    def test_registration_does_not_set_auth_cookies(self, mock_task):
+        response = self.client.post(reverse('auth-register'), {
+            "username": "newuser", "password": "pass12345", "email": "new@example.com",
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertNotIn('access_token', response.cookies)
+        self.assertNotIn('refresh_token', response.cookies)
+
+    @patch('users.services.send_email_task')
+    def test_registration_sends_confirmation_email(self, mock_task):
+        self.client.post(reverse('auth-register'), {
+            "username": "newuser", "password": "pass12345", "email": "new@example.com",
+        })
+        mock_task.delay.assert_called_once()
+        self.assertEqual(mock_task.delay.call_args.args[0], "new@example.com")
+
+    @patch('users.services.send_email_task')
+    def test_new_user_is_unverified_by_default(self, mock_task):
+        self.client.post(reverse('auth-register'), {
+            "username": "newuser", "password": "pass12345", "email": "new@example.com",
+        })
+        self.assertFalse(User.objects.get(username="newuser").email_verified)
 
     def test_users_without_email_do_not_collide_with_each_other(self):
         # Regression test for the CustomUserManager.normalize_email override:
@@ -182,6 +209,71 @@ class PasswordResetTest(APITestCase):
         response = self.client.post(reverse('password-reset-confirm'), {
             "uid": uid, "token": token, "new_password": "anotherpass789",
         })
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class EmailVerificationLoginGateTest(APITestCase):
+    def setUp(self):
+        self.verified_user = User.objects.create_user(
+            username="verified", password="pass12345", email="verified@example.com", email_verified=True,
+        )
+        self.unverified_user = User.objects.create_user(
+            username="unverified", password="pass12345", email="unverified@example.com", email_verified=False,
+        )
+
+    def test_verified_user_can_log_in(self):
+        response = self.client.post(reverse('auth-login'), {"username": "verified", "password": "pass12345"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_unverified_user_is_rejected(self):
+        response = self.client.post(reverse('auth-login'), {"username": "unverified", "password": "pass12345"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertNotIn('access_token', response.cookies)
+        self.assertNotIn('refresh_token', response.cookies)
+
+
+class EmailConfirmTest(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="confirmuser", password="pass12345", email="confirm@example.com")
+
+    def _valid_uid_token(self):
+        uid = urlsafe_base64_encode(force_bytes(self.user.pk))
+        token = email_confirmation_token_generator.make_token(self.user)
+        return uid, token
+
+    def test_confirm_with_valid_token_marks_verified(self):
+        uid, token = self._valid_uid_token()
+        response = self.client.post(reverse('email-confirm'), {"uid": uid, "token": token})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.email_verified)
+
+    def test_confirm_rejects_invalid_token(self):
+        uid = urlsafe_base64_encode(force_bytes(self.user.pk))
+        response = self.client.post(reverse('email-confirm'), {"uid": uid, "token": "not-a-real-token"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.email_verified)
+
+    def test_confirm_rejects_unknown_uid(self):
+        bogus_uid = urlsafe_base64_encode(force_bytes(999999))
+        response = self.client.post(reverse('email-confirm'), {"uid": bogus_uid, "token": "irrelevant"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_token_cannot_be_reused_after_already_confirmed(self):
+        uid, token = self._valid_uid_token()
+        self.client.post(reverse('email-confirm'), {"uid": uid, "token": token})
+        # email_verified is folded into the token's hash value, so it
+        # becomes invalid as soon as it's been used once.
+        response = self.client.post(reverse('email-confirm'), {"uid": uid, "token": token})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_password_reset_token_cannot_be_used_to_confirm_email(self):
+        # Regression test for the distinct key_salt: a password-reset token
+        # must not validate against the email-confirmation generator.
+        uid = urlsafe_base64_encode(force_bytes(self.user.pk))
+        reset_token = default_token_generator.make_token(self.user)
+        response = self.client.post(reverse('email-confirm'), {"uid": uid, "token": reset_token})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 

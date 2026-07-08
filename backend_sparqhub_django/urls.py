@@ -10,6 +10,7 @@ from users.views import (
     AdminUserViewSet,
     CookieTokenObtainPairView,
     CookieTokenRefreshView,
+    EmailConfirmAPIView,
     LogoutAPIView,
     CurrentUserAPIView,
     PasswordResetConfirmAPIView,
@@ -51,6 +52,7 @@ urlpatterns += [
     path('api/auth/me/',       CurrentUserAPIView.as_view(),       name='auth-me'),
     path('api/auth/password-reset/request/', PasswordResetRequestAPIView.as_view(), name='password-reset-request'),
     path('api/auth/password-reset/confirm/', PasswordResetConfirmAPIView.as_view(), name='password-reset-confirm'),
+    path('api/auth/confirm-email/', EmailConfirmAPIView.as_view(), name='email-confirm'),
     path('api/csrf/',          CsrfTokenView.as_view(),            name='csrf'),
 ]
 

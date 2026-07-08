@@ -1,8 +1,21 @@
 # users/serializers.py
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 User = get_user_model()
+
+class EmailVerifiedTokenObtainPairSerializer(TokenObtainPairSerializer):
+    """Gates login on email confirmation. Raising here (rather than in the
+    view) means CookieTokenObtainPairView's super().post() never returns a
+    Response, so no auth cookies get set for an unverified user."""
+
+    def validate(self, attrs):
+        data = super().validate(attrs)
+        if not self.user.email_verified:
+            raise PermissionDenied("Please confirm your email address before logging in.")
+        return data
 
 class UserRegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True)
