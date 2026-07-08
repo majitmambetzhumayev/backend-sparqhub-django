@@ -2,7 +2,6 @@ from functools import lru_cache
 
 from asgiref.sync import sync_to_async
 from pgvector.django import CosineDistance
-from sentence_transformers import SentenceTransformer
 
 from ai_providers.factory import provider_session
 
@@ -20,7 +19,15 @@ _TOP_K = 5
 
 
 @lru_cache(maxsize=1)
-def _get_model() -> SentenceTransformer:
+def _get_model():
+    # Imported lazily: sentence-transformers pulls in torch, which has a
+    # substantial baseline memory footprint just from being imported. Module-
+    # level import here meant every Django process paid that cost at startup
+    # (via librarian.urls -> views -> services, and chat_messages importing
+    # retrieve_relevant_memories), even for processes that never touch this
+    # feature — a real contributor to hitting a small container's memory cap.
+    from sentence_transformers import SentenceTransformer
+
     return SentenceTransformer(_MODEL_NAME)
 
 
