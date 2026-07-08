@@ -1,4 +1,5 @@
 anthropic
+authlib
 celery
 channels
 channels-redis

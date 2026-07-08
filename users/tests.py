@@ -1,12 +1,14 @@
 import asyncio
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from authlib.integrations.base_client import OAuthError
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
 from django.contrib.auth.tokens import default_token_generator
+from django.http import HttpResponseRedirect
 
-from users.services import email_confirmation_token_generator
-from django.test import TransactionTestCase, override_settings
+from users.services import email_confirmation_token_generator, get_or_create_oauth_user
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
@@ -344,3 +346,123 @@ class AdminUserViewSetTest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.other_user.refresh_from_db()
         self.assertFalse(self.other_user.is_staff)
+
+
+class GetOrCreateOAuthUserTest(TestCase):
+    def test_creates_new_verified_user(self):
+        user = get_or_create_oauth_user('google', 'g-1', 'newuser@example.com')
+        self.assertEqual(user.google_id, 'g-1')
+        self.assertTrue(user.email_verified)
+        self.assertEqual(user.email, 'newuser@example.com')
+        self.assertEqual(user.username, 'newuser')
+
+    def test_links_existing_unverified_user_by_email(self):
+        existing = User.objects.create_user(username='existing', password='pass', email='link@example.com')
+        self.assertFalse(existing.email_verified)
+
+        user = get_or_create_oauth_user('github', 'gh-1', 'link@example.com')
+
+        self.assertEqual(user.pk, existing.pk)
+        user.refresh_from_db()
+        self.assertEqual(user.github_id, 'gh-1')
+        self.assertTrue(user.email_verified)
+
+    def test_returns_same_user_on_repeat_call(self):
+        first = get_or_create_oauth_user('google', 'g-2', 'repeat@example.com')
+        second = get_or_create_oauth_user('google', 'g-2', 'repeat@example.com')
+        self.assertEqual(first.pk, second.pk)
+        self.assertEqual(User.objects.filter(google_id='g-2').count(), 1)
+
+    def test_generates_unique_username_on_collision(self):
+        User.objects.create_user(username='taken', password='pass')
+        user = get_or_create_oauth_user('google', 'g-3', 'taken@example.com')
+        self.assertNotEqual(user.username, 'taken')
+        self.assertTrue(user.username.startswith('taken'))
+
+
+class OAuthLoginViewTest(APITestCase):
+    def test_unknown_provider_returns_404(self):
+        response = self.client.get(reverse('oauth-login', kwargs={'provider': 'facebook'}))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch('users.views.oauth')
+    def test_known_provider_delegates_to_client_redirect(self, mock_oauth):
+        mock_client = MagicMock()
+        mock_client.authorize_redirect.return_value = HttpResponseRedirect('https://accounts.google.com/o/oauth2/auth')
+        mock_oauth.create_client.return_value = mock_client
+
+        self.client.get(reverse('oauth-login', kwargs={'provider': 'google'}))
+
+        mock_oauth.create_client.assert_called_once_with('google')
+        mock_client.authorize_redirect.assert_called_once()
+        redirect_uri = mock_client.authorize_redirect.call_args.args[1]
+        self.assertTrue(redirect_uri.endswith('/api/auth/oauth/google/callback/'))
+
+
+class OAuthCallbackViewTest(APITestCase):
+    def test_unknown_provider_returns_404(self):
+        response = self.client.get(reverse('oauth-callback', kwargs={'provider': 'facebook'}))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch('users.views.oauth')
+    def test_provider_error_redirects_to_login_with_error(self, mock_oauth):
+        mock_client = MagicMock()
+        mock_client.authorize_access_token.side_effect = OAuthError(error='access_denied')
+        mock_oauth.create_client.return_value = mock_client
+
+        response = self.client.get(reverse('oauth-callback', kwargs={'provider': 'google'}))
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertIn('/auth/login', response.url)
+
+    @patch('users.views.oauth')
+    def test_google_callback_creates_user_and_sets_auth_cookies(self, mock_oauth):
+        mock_client = MagicMock()
+        mock_client.authorize_access_token.return_value = {
+            'userinfo': {'sub': 'google-123', 'email': 'newgoogle@example.com'},
+        }
+        mock_oauth.create_client.return_value = mock_client
+
+        response = self.client.get(reverse('oauth-callback', kwargs={'provider': 'google'}))
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertIn('/dashboard', response.url)
+        self.assertIn('access_token', response.cookies)
+        self.assertIn('refresh_token', response.cookies)
+        user = User.objects.get(google_id='google-123')
+        self.assertEqual(user.email, 'newgoogle@example.com')
+        self.assertTrue(user.email_verified)
+
+    @patch('users.views.oauth')
+    def test_github_callback_falls_back_to_emails_endpoint(self, mock_oauth):
+        mock_client = MagicMock()
+        mock_client.authorize_access_token.return_value = {'access_token': 'tok'}
+        profile_response = MagicMock()
+        profile_response.json.return_value = {'id': 999, 'email': None}
+        emails_response = MagicMock()
+        emails_response.json.return_value = [
+            {'email': 'secondary@example.com', 'primary': False, 'verified': True},
+            {'email': 'primary@example.com', 'primary': True, 'verified': True},
+        ]
+        mock_client.get.side_effect = [profile_response, emails_response]
+        mock_oauth.create_client.return_value = mock_client
+
+        response = self.client.get(reverse('oauth-callback', kwargs={'provider': 'github'}))
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        user = User.objects.get(github_id='999')
+        self.assertEqual(user.email, 'primary@example.com')
+
+    @patch('users.views.oauth')
+    def test_missing_email_redirects_with_error(self, mock_oauth):
+        mock_client = MagicMock()
+        mock_client.authorize_access_token.return_value = {
+            'userinfo': {'sub': 'g-no-email', 'email': None},
+        }
+        mock_oauth.create_client.return_value = mock_client
+
+        response = self.client.get(reverse('oauth-callback', kwargs={'provider': 'google'}))
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertIn('oauth_no_email', response.url)
+        self.assertFalse(User.objects.filter(google_id='g-no-email').exists())

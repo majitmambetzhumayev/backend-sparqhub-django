@@ -1,5 +1,8 @@
+from authlib.integrations.base_client import OAuthError
 from django.contrib.auth import get_user_model
+from django.shortcuts import redirect
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.response import Response
 from rest_framework.permissions import IsAdminUser, IsAuthenticated, AllowAny
 from rest_framework.views import APIView
@@ -8,13 +11,20 @@ from django.conf import settings
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 
+from .oauth import oauth
 from .serializers import (
     AdminUserSerializer,
     EmailVerifiedTokenObtainPairSerializer,
     UserRegisterSerializer,
     CurrentUserSerializer,
 )
-from .services import confirm_email, confirm_password_reset, request_password_reset, send_confirmation_email
+from .services import (
+    confirm_email,
+    confirm_password_reset,
+    get_or_create_oauth_user,
+    request_password_reset,
+    send_confirmation_email,
+)
 
 
 def _set_auth_cookies(response, access, refresh=None):
@@ -127,6 +137,65 @@ class EmailConfirmAPIView(APIView):
         if not confirm_email(uid, token):
             return Response({'error': 'This confirmation link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
         return Response({'detail': 'Email confirmed. You can now log in.'})
+
+
+_OAUTH_PROVIDERS = ('google', 'github')
+
+
+def _github_primary_email(client, token) -> str | None:
+    emails = client.get('user/emails', token=token).json()
+    primary = next((e['email'] for e in emails if e.get('primary') and e.get('verified')), None)
+    if primary:
+        return primary
+    verified = next((e['email'] for e in emails if e.get('verified')), None)
+    return verified
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class OAuthLoginAPIView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def get(self, request, provider):
+        if provider not in _OAUTH_PROVIDERS:
+            return Response({'error': 'Unknown provider.'}, status=status.HTTP_404_NOT_FOUND)
+        client = oauth.create_client(provider)
+        redirect_uri = f"{settings.BACKEND_URL.rstrip('/')}/api/auth/oauth/{provider}/callback/"
+        return client.authorize_redirect(request, redirect_uri)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class OAuthCallbackAPIView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def get(self, request, provider):
+        if provider not in _OAUTH_PROVIDERS:
+            return Response({'error': 'Unknown provider.'}, status=status.HTTP_404_NOT_FOUND)
+
+        client = oauth.create_client(provider)
+        try:
+            token = client.authorize_access_token(request)
+        except OAuthError:
+            return redirect(f"{settings.FRONTEND_URL.rstrip('/')}/auth/login?error=oauth_failed")
+
+        if provider == 'google':
+            userinfo = token.get('userinfo') or {}
+            provider_user_id = userinfo.get('sub')
+            email = userinfo.get('email')
+        else:
+            profile = client.get('user', token=token).json()
+            provider_user_id = str(profile.get('id'))
+            email = profile.get('email') or _github_primary_email(client, token)
+
+        if not provider_user_id or not email:
+            return redirect(f"{settings.FRONTEND_URL.rstrip('/')}/auth/login?error=oauth_no_email")
+
+        user = get_or_create_oauth_user(provider, provider_user_id, email)
+        refresh = RefreshToken.for_user(user)
+        response = redirect(f"{settings.FRONTEND_URL.rstrip('/')}/dashboard")
+        _set_auth_cookies(response, str(refresh.access_token), str(refresh))
+        return response
 
 
 class CurrentUserAPIView(APIView):

@@ -37,6 +37,11 @@ class CustomUser(AbstractUser):
     # so this doesn't lock anyone out retroactively — only new registrations
     # are actually gated by this.
     email_verified = models.BooleanField(default=False)
+    # Set on first OAuth login with that provider; used to find-or-create the
+    # matching CustomUser on subsequent logins. Nullable+unique for the same
+    # reason as `email` above — most users won't have used a given provider.
+    google_id = models.CharField(max_length=255, unique=True, null=True, blank=True, default=None)
+    github_id = models.CharField(max_length=255, unique=True, null=True, blank=True, default=None)
 
     objects = CustomUserManager()
     bio = models.TextField(blank=True, null=True)

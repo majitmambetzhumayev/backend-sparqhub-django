@@ -87,3 +87,41 @@ def confirm_email(uid: str, token: str) -> bool:
     user.email_verified = True
     user.save(update_fields=["email_verified"])
     return True
+
+
+def _generate_unique_username(email: str) -> str:
+    base = email.split('@')[0] or 'user'
+    username = base
+    suffix = 1
+    while User.objects.filter(username=username).exists():
+        suffix += 1
+        username = f"{base}{suffix}"
+    return username
+
+
+def get_or_create_oauth_user(provider: str, provider_user_id: str, email: str):
+    """provider is 'google' or 'github' — matches the CustomUser.<provider>_id
+    field name. Both providers verify email ownership themselves, so a match
+    (by provider id, then by email) or a fresh account is always marked
+    email_verified — this is the one path that bypasses the confirmation
+    email entirely."""
+    id_field = f"{provider}_id"
+
+    user = User.objects.filter(**{id_field: provider_user_id}).first()
+    if user is not None:
+        return user
+
+    user = User.objects.filter(email=email).first()
+    if user is not None:
+        setattr(user, id_field, provider_user_id)
+        user.email_verified = True
+        user.save(update_fields=[id_field, "email_verified"])
+        return user
+
+    username = _generate_unique_username(email)
+    return User.objects.create_user(
+        username=username,
+        email=email,
+        email_verified=True,
+        **{id_field: provider_user_id},
+    )
