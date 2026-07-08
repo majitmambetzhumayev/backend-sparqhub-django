@@ -1,6 +1,5 @@
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
-from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.response import Response
 from rest_framework.permissions import IsAdminUser, IsAuthenticated, AllowAny
 from rest_framework.views import APIView
@@ -9,8 +8,13 @@ from django.conf import settings
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 
-from .serializers import AdminUserSerializer, UserRegisterSerializer, CurrentUserSerializer
-from .services import confirm_password_reset, request_password_reset
+from .serializers import (
+    AdminUserSerializer,
+    EmailVerifiedTokenObtainPairSerializer,
+    UserRegisterSerializer,
+    CurrentUserSerializer,
+)
+from .services import confirm_email, confirm_password_reset, request_password_reset, send_confirmation_email
 
 
 def _set_auth_cookies(response, access, refresh=None):
@@ -24,6 +28,8 @@ def _set_auth_cookies(response, access, refresh=None):
 @method_decorator(ensure_csrf_cookie, name='dispatch')
 @method_decorator(csrf_exempt, name='dispatch')
 class CookieTokenObtainPairView(TokenObtainPairView):
+    serializer_class = EmailVerifiedTokenObtainPairSerializer
+
     def post(self, request, *args, **kwargs):
         response = super().post(request, *args, **kwargs)
         _set_auth_cookies(response, response.data['access'], response.data['refresh'])
@@ -49,11 +55,14 @@ class RegisterAPIView(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
-
-        refresh = RefreshToken.for_user(user)
-        response = Response({'detail': 'User registered successfully.'}, status=status.HTTP_201_CREATED)
-        _set_auth_cookies(response, str(refresh.access_token), str(refresh))
-        return response
+        send_confirmation_email(user)
+        # No cookies set here — login is gated on email_verified
+        # (CookieTokenObtainPairView), so registering doesn't log the user
+        # in until they've confirmed their email.
+        return Response(
+            {'detail': 'Registration successful. Please check your email to confirm your account.'},
+            status=status.HTTP_201_CREATED,
+        )
 
 
 @method_decorator(csrf_exempt, name='dispatch')
@@ -103,6 +112,21 @@ class PasswordResetConfirmAPIView(APIView):
         if not confirm_password_reset(uid, token, new_password):
             return Response({'error': 'This reset link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
         return Response({'detail': 'Password has been reset.'})
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class EmailConfirmAPIView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        uid = request.data.get('uid', '')
+        token = request.data.get('token', '')
+        if not (uid and token):
+            return Response({'error': 'uid and token are required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not confirm_email(uid, token):
+            return Response({'error': 'This confirmation link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'detail': 'Email confirmed. You can now log in.'})
 
 
 class CurrentUserAPIView(APIView):
