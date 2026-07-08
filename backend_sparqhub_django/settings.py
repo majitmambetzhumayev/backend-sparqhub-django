@@ -38,6 +38,12 @@ if SENTRY_DSN:
 # Used to build absolute URLs for generated media (e.g. AI-generated images)
 # from contexts with no HTTP request object, like the WebSocket consumer.
 BACKEND_URL = config('BACKEND_URL', default='http://localhost:8000')
+# Used to build links that must point at the frontend (password reset,
+# email confirmation) rather than this backend.
+FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000')
+
+RESEND_API_KEY = config('RESEND_API_KEY', default='')
+DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='noreply@sparqup.fr')
 
 AUTH_USER_MODEL = 'users.CustomUser'
 

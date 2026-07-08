@@ -10,6 +10,7 @@ from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 
 from .serializers import AdminUserSerializer, UserRegisterSerializer, CurrentUserSerializer
+from .services import confirm_password_reset, request_password_reset
 
 
 def _set_auth_cookies(response, access, refresh=None):
@@ -70,6 +71,38 @@ class LogoutAPIView(APIView):
         response.delete_cookie('refresh_token', path='/', domain=domain)
         response.delete_cookie('sessionid', path='/', domain=domain)
         return response
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class PasswordResetRequestAPIView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '')
+        if email:
+            request_password_reset(email)
+        # Always the same response, whether or not the email is registered —
+        # the point of this endpoint is to not leak that information.
+        return Response({'detail': 'If that email is registered, a reset link has been sent.'})
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class PasswordResetConfirmAPIView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        uid = request.data.get('uid', '')
+        token = request.data.get('token', '')
+        new_password = request.data.get('new_password', '')
+        if not (uid and token and new_password):
+            return Response({'error': 'uid, token and new_password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(new_password) < 8:
+            return Response({'error': 'Password must be at least 8 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not confirm_password_reset(uid, token, new_password):
+            return Response({'error': 'This reset link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'detail': 'Password has been reset.'})
 
 
 class CurrentUserAPIView(APIView):

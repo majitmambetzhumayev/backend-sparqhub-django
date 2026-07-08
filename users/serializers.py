@@ -6,10 +6,19 @@ User = get_user_model()
 
 class UserRegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True)
+    # email is nullable at the DB level (existing accounts predate this
+    # requirement) but every new registration must provide a real, unique
+    # one — required for password reset and email confirmation to work.
+    email = serializers.EmailField(required=True)
 
     class Meta:
         model = User
-        fields = ['username', 'password']
+        fields = ['username', 'email', 'password']
+
+    def validate_email(self, value):
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError("An account with this email already exists.")
+        return value
 
     def create(self, validated_data):
         # create_user (not a plain .save()) is required to hash the password.
@@ -22,6 +31,7 @@ class CurrentUserSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'username',
+            'email',
             'bio',
             'profile_picture',
             'timezone',
@@ -30,6 +40,7 @@ class CurrentUserSerializer(serializers.ModelSerializer):
             'credits_remaining',
             'is_staff',
         ]
+        read_only_fields = ['email']
 
 
 class AdminUserSerializer(serializers.ModelSerializer):
