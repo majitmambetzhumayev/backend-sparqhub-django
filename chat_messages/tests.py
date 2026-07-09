@@ -12,6 +12,7 @@ from rest_framework import status
 
 from ai_providers.chat_router import InsufficientCreditsError
 from assistants.models import Assistant
+from chat_messages import generation_registry
 from chat_messages.consumers import ConversationConsumer
 from chat_messages.models import Message
 from chat_messages.services import send_message, _record_turn
@@ -180,14 +181,19 @@ class SendMessageServiceTest(TransactionTestCase):
 class ConversationConsumerTest(TransactionTestCase):
     def setUp(self):
         self.user = User.objects.create_user(username="wsuser", password="pass")
+        self.assistant = Assistant.objects.create(
+            user=self.user, name="Chat Assistant", instructions="Be concise.",
+        )
+        self.existing_thread = Thread.objects.create(user=self.user, assistant=self.assistant, conversation_state=[])
 
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
     @patch("chat_messages.services.send_chat_message")
     def test_streams_chunks_then_done_and_saves_message(self, mock_send, mock_memories, mock_extract_task, mock_title_task):
-        # Mock one level below stream_message (not stream_message itself) so the
-        # real _record_turn/persistence logic actually runs and can be asserted on.
+        # Mock one level below run_and_broadcast_turn (not that function itself)
+        # so the real _record_turn/persistence logic actually runs and can be
+        # asserted on.
         async def fake_chunks():
             for chunk in ["Hel", "lo!"]:
                 yield chunk
@@ -258,16 +264,73 @@ class ConversationConsumerTest(TransactionTestCase):
     @patch('chat_messages.services.extract_memories_task')
     @patch('chat_messages.consumers.retrieve_relevant_memories', return_value=[])
     @patch('chat_messages.services.send_chat_message')
-    def test_rejects_second_message_while_a_turn_is_still_in_flight(
+    def test_rejects_second_message_for_the_same_thread_while_a_turn_is_still_in_flight(
         self, mock_send, mock_memories, mock_extract_task, mock_title_task,
     ):
-        # Regression test: _pending_confirmation/_active_task are single
-        # instance attributes on the consumer. Without this guard, a second
-        # message sent on the same connection while a turn is still running
-        # would spawn a second concurrent _handle_chat_message task, and if
-        # both ended up awaiting confirmation, the second would silently
-        # steal/overwrite the first turn's confirmation future — leaving the
-        # first turn hanging forever with no error ever sent.
+        # Regression test for the per-thread claim (generation_registry.try_claim):
+        # without it, two messages for the SAME existing thread arriving
+        # close together (a double-click, two tabs) would both pass and spin
+        # up two concurrent generations — two LLM calls, two _record_turn
+        # calls, credits deducted twice. Generation is now owned by
+        # generation_registry, not a per-connection attribute, so this must
+        # be tested against a real, already-existing thread_id (a fresh
+        # thread_id: None create isn't shared/race-able the same way — see
+        # test_rejects_second_new_thread_message_on_the_same_connection below
+        # for that, separate, case).
+        release_first_call = asyncio.Event()
+        entered_first_call = asyncio.Event()
+
+        async def fake_send_chat_message(*args, **kwargs):
+            entered_first_call.set()
+            await release_first_call.wait()
+
+            async def fake_chunks():
+                yield "Done."
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "First"})
+            thinking_frame = await communicator.receive_json_from()
+            await entered_first_call.wait()
+
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Second"})
+            rejection_frame = await communicator.receive_json_from()
+
+            release_first_call.set()
+            chunk_frame = await communicator.receive_json_from()
+            done_frame = await communicator.receive_json_from()
+
+            await communicator.disconnect()
+            return thinking_frame, rejection_frame, chunk_frame, done_frame
+
+        thinking_frame, rejection_frame, chunk_frame, done_frame = run(scenario())
+        self.assertEqual(thinking_frame, {"status": "thinking"})
+        self.assertIn("error", rejection_frame)
+        self.assertEqual(chunk_frame, {"chunk": "Done."})
+        self.assertTrue(done_frame["done"])
+        # send_chat_message was only ever invoked once — the second message
+        # was rejected before spawning a competing turn.
+        self.assertEqual(mock_send.call_count, 1)
+
+    @patch('chat_messages.services.generate_thread_title_task')
+    @patch('chat_messages.services.extract_memories_task')
+    @patch('chat_messages.consumers.retrieve_relevant_memories', return_value=[])
+    @patch('chat_messages.services.send_chat_message')
+    def test_rejects_second_new_thread_message_on_the_same_connection(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # A brand-new thread (thread_id: None) has no id yet to claim in
+        # generation_registry before the first one is resolved — this is
+        # exactly the case self._creating_thread exists to guard, on this
+        # one connection, since generation_registry can't.
         release_first_call = asyncio.Event()
         entered_first_call = asyncio.Event()
 
@@ -296,19 +359,15 @@ class ConversationConsumerTest(TransactionTestCase):
             rejection_frame = await communicator.receive_json_from()
 
             release_first_call.set()
-            chunk_frame = await communicator.receive_json_from()
-            done_frame = await communicator.receive_json_from()
+            await communicator.receive_json_from()  # chunk
+            await communicator.receive_json_from()  # done
 
             await communicator.disconnect()
-            return thinking_frame, rejection_frame, chunk_frame, done_frame
+            return thinking_frame, rejection_frame
 
-        thinking_frame, rejection_frame, chunk_frame, done_frame = run(scenario())
+        thinking_frame, rejection_frame = run(scenario())
         self.assertEqual(thinking_frame, {"status": "thinking"})
         self.assertIn("error", rejection_frame)
-        self.assertEqual(chunk_frame, {"chunk": "Done."})
-        self.assertTrue(done_frame["done"])
-        # send_chat_message was only ever invoked once — the second message
-        # was rejected before spawning a competing turn.
         self.assertEqual(mock_send.call_count, 1)
 
     def test_rejects_anonymous_connection(self):
@@ -393,7 +452,9 @@ class ConversationConsumerTest(TransactionTestCase):
             thinking_frame = await communicator.receive_json_from()
             confirm_frame = await communicator.receive_json_from()
 
-            await communicator.send_json_to({"type": "tool_confirmation", "confirmed": True})
+            await communicator.send_json_to(
+                {"type": "tool_confirmation", "thread_id": confirm_frame["thread_id"], "confirmed": True},
+            )
             chunk_frame = await communicator.receive_json_from()
             done_frame = await communicator.receive_json_from()
 
@@ -402,7 +463,9 @@ class ConversationConsumerTest(TransactionTestCase):
 
         thinking_frame, confirm_frame, chunk_frame, done_frame = run(scenario())
         self.assertEqual(thinking_frame, {"status": "thinking"})
-        self.assertEqual(confirm_frame, {"status": "confirm_required", "tool": "delegate_to_model", "arguments": {"provider": "gemini"}})
+        self.assertEqual(confirm_frame["status"], "confirm_required")
+        self.assertEqual(confirm_frame["tool"], "delegate_to_model")
+        self.assertEqual(confirm_frame["arguments"], {"provider": "gemini"})
         self.assertEqual(chunk_frame, {"chunk": "Confirmed!"})
         self.assertTrue(done_frame["done"])
 
@@ -431,9 +494,11 @@ class ConversationConsumerTest(TransactionTestCase):
 
             await communicator.send_json_to({"thread_id": None, "message": "Hi"})
             await communicator.receive_json_from()  # thinking
-            await communicator.receive_json_from()  # confirm_required
+            confirm_frame = await communicator.receive_json_from()
 
-            await communicator.send_json_to({"type": "tool_confirmation", "confirmed": False})
+            await communicator.send_json_to(
+                {"type": "tool_confirmation", "thread_id": confirm_frame["thread_id"], "confirmed": False},
+            )
             chunk_frame = await communicator.receive_json_from()
 
             await communicator.disconnect()
@@ -441,6 +506,141 @@ class ConversationConsumerTest(TransactionTestCase):
 
         chunk_frame = run(scenario())
         self.assertEqual(chunk_frame, {"chunk": "Declined."})
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
+    def test_generation_survives_disconnect_and_still_persists(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # Core regression test for the incident this whole change exists to
+        # fix: a dropped connection must not cancel the in-flight generation
+        # — it keeps running, and the message still gets saved, even though
+        # nobody is listening anymore by the time it finishes.
+        release_call = asyncio.Event()
+
+        async def fake_send_chat_message(*args, **kwargs):
+            await release_call.wait()
+
+            async def fake_chunks():
+                yield "Still here!"
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            await communicator.receive_json_from()  # thinking
+
+            # attach_task() runs slightly after the "thinking" frame is sent
+            # (see _start_generation) — poll briefly rather than assuming
+            # it's already there the instant "thinking" is received.
+            task = None
+            for _ in range(20):
+                gen = generation_registry._active.get(self.existing_thread.id)
+                if gen is not None and gen.task is not None:
+                    task = gen.task
+                    break
+                await asyncio.sleep(0)
+            assert task is not None, "generation task was never registered"
+
+            await communicator.disconnect()
+
+            # The whole point: disconnect() must not have cancelled it.
+            assert not task.cancelled()
+            assert not task.done()
+
+            release_call.set()
+            await task  # nobody is listening anymore — it must still finish cleanly
+
+        run(scenario())
+
+        self.assertEqual(Message.objects.filter(thread=self.existing_thread).count(), 2)
+        self.existing_thread.refresh_from_db()
+        self.assertEqual(
+            self.existing_thread.conversation_state[-1],
+            {"role": "assistant", "content": "Still here!"},
+        )
+        # The registry entry must be released once the task completes, or a
+        # later message on this thread would be rejected forever.
+        self.assertFalse(generation_registry.is_active(self.existing_thread.id))
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
+    def test_second_connection_can_join_and_receive_live_chunks(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        release_call = asyncio.Event()
+
+        async def fake_send_chat_message(*args, **kwargs):
+            await release_call.wait()
+
+            async def fake_chunks():
+                yield "Live chunk"
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            first = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            first.scope["user"] = self.user
+            connected, _ = await first.connect()
+            assert connected
+
+            await first.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            await first.receive_json_from()  # thinking
+
+            second = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            second.scope["user"] = self.user
+            connected2, _ = await second.connect()
+            assert connected2
+
+            await second.send_json_to({"type": "join_thread", "thread_id": self.existing_thread.id})
+            resuming_frame = await second.receive_json_from()
+
+            release_call.set()
+            first_chunk = await first.receive_json_from()
+            second_chunk = await second.receive_json_from()
+            first_done = await first.receive_json_from()
+            second_done = await second.receive_json_from()
+
+            await first.disconnect()
+            await second.disconnect()
+            return resuming_frame, first_chunk, second_chunk, first_done, second_done
+
+        resuming_frame, first_chunk, second_chunk, first_done, second_done = run(scenario())
+        self.assertEqual(resuming_frame, {"status": "resuming"})
+        self.assertEqual(first_chunk, {"chunk": "Live chunk"})
+        self.assertEqual(second_chunk, {"chunk": "Live chunk"})
+        self.assertTrue(first_done["done"])
+        self.assertTrue(second_done["done"])
+
+    def test_join_thread_rejects_a_thread_belonging_to_another_user(self):
+        other_user = User.objects.create_user(username="otheruser", password="pass")
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = other_user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"type": "join_thread", "thread_id": self.existing_thread.id})
+            frame = await communicator.receive_json_from()
+            await communicator.disconnect()
+            return frame
+
+        frame = run(scenario())
+        self.assertIn("error", frame)
 
 
 class SendMessageAPICreditsTest(APITestCase):
