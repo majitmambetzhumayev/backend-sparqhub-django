@@ -8,10 +8,10 @@ from threads.models import Thread
 from threads.tasks import generate_thread_title_task
 
 
-def _record_turn(thread, history, user_text, assistant_text):
+def _record_turn(thread, history, user_text, assistant_text, tool_calls=None):
     Message.objects.bulk_create([
         Message(thread=thread, sender="user", content=user_text),
-        Message(thread=thread, sender="assistant", content=assistant_text),
+        Message(thread=thread, sender="assistant", content=assistant_text, tool_calls=tool_calls or []),
     ])
     is_first_turn = not history
     with transaction.atomic():
@@ -45,11 +45,17 @@ def _record_turn(thread, history, user_text, assistant_text):
 
 async def send_message(thread, text, user, memories=None) -> str:
     history = thread.conversation_state or []
+    tool_calls: list[str] = []
+
+    async def track_tool_call(tool_name):
+        tool_calls.append(tool_name)
+
     response_text, usage, used_global_key = await send_chat_message(
         thread.assistant, text, ai_provider=thread.ai_provider, model=thread.model, user=user,
         conversation_history=history, memories=memories, stream=False, project_id=thread.project_id,
+        on_tool_call=track_tool_call,
     )
-    await sync_to_async(_record_turn)(thread, history, text, response_text)
+    await sync_to_async(_record_turn)(thread, history, text, response_text, tool_calls)
     if used_global_key:
         await deduct_credits(user, thread.ai_provider, thread.model, usage)
     return response_text
@@ -57,15 +63,22 @@ async def send_message(thread, text, user, memories=None) -> str:
 
 async def stream_message(thread, text, user, memories=None, on_tool_call=None, confirm_tool_call=None):
     history = thread.conversation_state or []
+    tool_calls: list[str] = []
+
+    async def track_tool_call(tool_name):
+        tool_calls.append(tool_name)
+        if on_tool_call is not None:
+            await on_tool_call(tool_name)
+
     chunks, usage, used_global_key = await send_chat_message(
         thread.assistant, text, ai_provider=thread.ai_provider, model=thread.model, user=user,
         conversation_history=history, memories=memories, stream=True, project_id=thread.project_id,
-        on_tool_call=on_tool_call, confirm_tool_call=confirm_tool_call,
+        on_tool_call=track_tool_call, confirm_tool_call=confirm_tool_call,
     )
     collected = []
     async for chunk in chunks:
         collected.append(chunk)
         yield chunk
-    await sync_to_async(_record_turn)(thread, history, text, "".join(collected))
+    await sync_to_async(_record_turn)(thread, history, text, "".join(collected), tool_calls)
     if used_global_key:
         await deduct_credits(user, thread.ai_provider, thread.model, usage)

@@ -13,4 +13,5 @@ class MessageSerializer(serializers.ModelSerializer):
             'timestamp',
             'edited',
             'read',
+            'tool_calls',
         ]
