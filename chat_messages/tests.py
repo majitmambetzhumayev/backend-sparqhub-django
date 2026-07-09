@@ -59,6 +59,24 @@ class SendMessageServiceTest(TransactionTestCase):
 
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.services.send_chat_message")
+    def test_records_tool_calls_used_during_the_turn(self, mock_send, mock_extract_task, mock_title_task):
+        async def fake_send_chat_message(*args, **kwargs):
+            await kwargs["on_tool_call"]("search_memories")
+            await kwargs["on_tool_call"]("generate_image")
+            return "Hi there!", None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        run(send_message(self.thread, "Hello", self.user))
+
+        assistant_message = Message.objects.get(thread=self.thread, sender="assistant")
+        self.assertEqual(assistant_message.tool_calls, ["search_memories", "generate_image"])
+        user_message = Message.objects.get(thread=self.thread, sender="user")
+        self.assertEqual(user_message.tool_calls, [])
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.services.send_chat_message", new_callable=AsyncMock)
     def test_records_turn_bumps_updated_at(self, mock_send, mock_extract_task, mock_title_task):
         # Regression test: update_fields previously omitted "updated_at", so
@@ -231,6 +249,10 @@ class ConversationConsumerTest(TransactionTestCase):
         self.assertEqual(frames[1], {"status": "tool_call", "tool": "search_memories"})
         self.assertEqual(frames[2], {"chunk": "Done."})
         self.assertEqual(frames[3]["done"], True)
+
+        thread = Thread.objects.get(pk=frames[3]["thread_id"])
+        assistant_message = Message.objects.get(thread=thread, sender="assistant")
+        self.assertEqual(assistant_message.tool_calls, ["search_memories"])
 
     @patch('chat_messages.services.generate_thread_title_task')
     @patch('chat_messages.services.extract_memories_task')
