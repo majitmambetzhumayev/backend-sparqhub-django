@@ -89,6 +89,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'core.middleware.permissions_policy_middleware',
 ]
 
 ROOT_URLCONF = 'backend_sparqhub_django.urls'
@@ -198,6 +199,23 @@ CSRF_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SAMESITE = 'Lax'
 CSRF_COOKIE_DOMAIN = COOKIE_DOMAIN
 SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SECURE = not DEBUG
+
+# Render terminates TLS at its edge and forwards plain HTTP internally, so
+# request.is_secure() (and therefore SECURE_SSL_REDIRECT) would never see a
+# request as secure without being told which header carries the original
+# scheme — this is Render's (and most PaaS's) standard proxy header.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SECURE_SSL_REDIRECT = not DEBUG
+
+# 2 years, matching the value Vercel already sets automatically for the
+# frontend. No preload: submitting to browsers' HSTS preload list is close
+# to irreversible (removal takes months to propagate), and would force every
+# current and future subdomain of sparqup.fr onto HTTPS forever — not a
+# decision to make implicitly via a header default.
+SECURE_HSTS_SECONDS = 63072000 if not DEBUG else 0
+SECURE_HSTS_INCLUDE_SUBDOMAINS = not DEBUG
+SECURE_HSTS_PRELOAD = False
 
 SIMPLE_JWT = {
     'AUTH_COOKIE': 'access_token',
