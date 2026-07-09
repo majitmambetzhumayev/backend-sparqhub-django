@@ -1,11 +1,23 @@
+import asyncio
+import logging
+
 from asgiref.sync import sync_to_async
 from django.db import transaction
 
-from ai_providers.chat_router import send_chat_message, deduct_credits
+from ai_providers.chat_router import InsufficientCreditsError, send_chat_message, deduct_credits
 from chat_messages.models import Message
 from librarian.tasks import extract_memories_task
 from threads.models import Thread
 from threads.tasks import generate_thread_title_task
+
+logger = logging.getLogger(__name__)
+
+# Plain constant, matching the style of e.g. chat_router.py's
+# CREDIT_VALUE_USD — not environment-specific, no reason for this to be a
+# config() value. An abandoned tool confirmation (everyone disconnected
+# while a delegate_to_model approval was pending) is treated as declined
+# after this long, so the task/generation_registry entry can't hang forever.
+CONFIRMATION_TIMEOUT_SECONDS = 300
 
 
 def _record_turn(thread, history, user_text, assistant_text, tool_calls=None):
@@ -61,24 +73,77 @@ async def send_message(thread, text, user, memories=None) -> str:
     return response_text
 
 
-async def stream_message(thread, text, user, memories=None, on_tool_call=None, confirm_tool_call=None):
+async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
+    """Owns a turn's full lifecycle end to end — unlike the old stream_message
+    (a generator the caller drove and could abandon by cancelling), this runs
+    to completion on its own regardless of whether any WebSocket connection
+    is still attached, broadcasting every frame to `group_name` via the
+    Channels group (already Redis-backed, no new infra) instead of calling
+    back into a single owning connection. Meant to be scheduled with
+    asyncio.create_task and tracked in generation_registry, not awaited
+    directly by a request/receive handler — see ConversationConsumer.
+
+    _record_turn/deduct_credits sit inside the try, unconditional on anyone
+    being in the group (group_send to an empty group is a documented no-op,
+    it never raises) — this is what guarantees the message is always saved
+    and credits always deducted exactly once, regardless of connection state
+    when the turn finishes. Don't wrap the group_send calls in something that
+    would also swallow that.
+    """
+    from channels.layers import get_channel_layer
+    from chat_messages import generation_registry
+
+    channel_layer = get_channel_layer()
     history = thread.conversation_state or []
     tool_calls: list[str] = []
 
     async def track_tool_call(tool_name):
         tool_calls.append(tool_name)
-        if on_tool_call is not None:
-            await on_tool_call(tool_name)
+        await channel_layer.group_send(group_name, {"type": "chat.status", "status": "tool_call", "tool": tool_name})
 
-    chunks, usage, used_global_key = await send_chat_message(
-        thread.assistant, text, ai_provider=thread.ai_provider, model=thread.model, user=user,
-        conversation_history=history, memories=memories, stream=True, project_id=thread.project_id,
-        on_tool_call=track_tool_call, confirm_tool_call=confirm_tool_call,
-    )
-    collected = []
-    async for chunk in chunks:
-        collected.append(chunk)
-        yield chunk
-    await sync_to_async(_record_turn)(thread, history, text, "".join(collected), tool_calls)
-    if used_global_key:
-        await deduct_credits(user, thread.ai_provider, thread.model, usage)
+    async def confirm_tool_call(tool_name, arguments):
+        future = asyncio.get_event_loop().create_future()
+        generation_registry.set_confirmation_future(thread.id, future)
+        # thread_id rides along so a client that doesn't know it yet (a
+        # brand-new thread, mid-first-turn, before the 'done' frame ever
+        # delivers an id) can still reply with the right thread_id.
+        await channel_layer.group_send(
+            group_name,
+            {"type": "chat.confirm_required", "tool": tool_name, "arguments": arguments, "thread_id": thread.id},
+        )
+        try:
+            return await asyncio.wait_for(future, timeout=CONFIRMATION_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            logger.warning("Tool confirmation for thread %s timed out with no client attached", thread.id)
+            return False
+        finally:
+            generation_registry.set_confirmation_future(thread.id, None)
+
+    try:
+        chunks, usage, used_global_key = await send_chat_message(
+            thread.assistant, text, ai_provider=thread.ai_provider, model=thread.model, user=user,
+            conversation_history=history, memories=memories, stream=True, project_id=thread.project_id,
+            on_tool_call=track_tool_call, confirm_tool_call=confirm_tool_call,
+        )
+        collected = []
+        async for chunk in chunks:
+            collected.append(chunk)
+            await channel_layer.group_send(group_name, {"type": "chat.chunk", "chunk": chunk})
+        assistant_text = "".join(collected)
+        await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls)
+        if used_global_key:
+            await deduct_credits(user, thread.ai_provider, thread.model, usage)
+    except InsufficientCreditsError as exc:
+        await channel_layer.group_send(group_name, {"type": "chat.error", "error": str(exc)})
+        return
+    except Exception:
+        logger.exception("Error while streaming chat response for thread %s", thread.id)
+        await channel_layer.group_send(
+            group_name,
+            {"type": "chat.error", "error": "Something went wrong while generating the response. Please try again."},
+        )
+        return
+    finally:
+        generation_registry.release(thread.id)
+
+    await channel_layer.group_send(group_name, {"type": "chat.done", "thread_id": thread.id})
