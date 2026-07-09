@@ -1,6 +1,6 @@
 from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 from core.services import send_email
 
@@ -16,3 +16,10 @@ class SendEmailTest(SimpleTestCase):
             "subject": "Subject line",
             "html": "<p>Body</p>",
         })
+
+
+class PermissionsPolicyMiddlewareTest(TestCase):
+    def test_adds_permissions_policy_header(self):
+        response = self.client.get('/api/healthcheck/')
+        self.assertIn('camera=()', response['Permissions-Policy'])
+        self.assertIn('microphone=()', response['Permissions-Policy'])
