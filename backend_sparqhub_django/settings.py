@@ -177,7 +177,20 @@ CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CHANNEL_LAYERS = {
     'default': {
         'BACKEND': 'channels_redis.core.RedisChannelLayer',
-        'CONFIG': {'hosts': [_REDIS_URL]},
+        'CONFIG': {
+            # channels_redis long-polls for messages via BZPOPMIN with its own
+            # brpop_timeout (5s) — a normal, expected wait, not an error. With
+            # no explicit socket_timeout/retry_on_timeout, any transient read
+            # hiccup on that connection (observed repeatedly against Render's
+            # free-tier Key Value instance) raises redis.exceptions.TimeoutError
+            # uncaught, which crashes the entire ASGI WebSocket connection.
+            'hosts': [{
+                'address': _REDIS_URL,
+                'socket_timeout': 20,
+                'socket_keepalive': True,
+                'retry_on_timeout': True,
+            }],
+        },
     },
 }
 
