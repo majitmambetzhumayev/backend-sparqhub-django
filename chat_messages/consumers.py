@@ -87,6 +87,11 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         should send {"type": "join_thread", "thread_id": int} to attach to
         that thread's group and find out whether a generation is already in
         flight for it, without starting a new one.
+
+        {"type": "stop_generation", "thread_id": int} cancels an in-flight
+        generation for that thread. Whatever was already generated is saved
+        (see run_and_broadcast_turn's CancelledError handling) and the group
+        gets a {"done": true, "thread_id": int, "stopped": true} frame.
         """
         data = json.loads(text_data)
         msg_type = data.get("type")
@@ -99,6 +104,10 @@ class ConversationConsumer(AsyncWebsocketConsumer):
 
         if msg_type == "join_thread":
             await self._join_thread(data.get("thread_id"))
+            return
+
+        if msg_type == "stop_generation":
+            await self._stop_generation(data.get("thread_id"))
             return
 
         # New chat message (thread_id may be None for a brand-new thread).
@@ -159,6 +168,22 @@ class ConversationConsumer(AsyncWebsocketConsumer):
             })
         else:
             await self._safe_send({"status": "resuming"})
+
+    async def _stop_generation(self, thread_id) -> None:
+        if thread_id is None:
+            return
+        user = self.scope["user"]
+        try:
+            # Same ownership check as _join_thread — without it, any
+            # authenticated user could cancel someone else's generation by
+            # guessing/sending a thread_id.
+            await sync_to_async(get_or_create_thread)(user, thread_id=thread_id)
+        except Thread.DoesNotExist:
+            await self._safe_send({"error": "Thread not found."})
+            return
+        task = generation_registry.get_task(thread_id)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _safe_send(self, payload: dict) -> None:
         """The transport can already be gone by the time we try to report an
@@ -254,7 +279,10 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         })
 
     async def chat_done(self, event):
-        await self._safe_send({"done": True, "thread_id": event["thread_id"]})
+        payload = {"done": True, "thread_id": event["thread_id"]}
+        if event.get("stopped"):
+            payload["stopped"] = True
+        await self._safe_send(payload)
 
     async def chat_error(self, event):
         await self._safe_send({"error": event["error"]})
