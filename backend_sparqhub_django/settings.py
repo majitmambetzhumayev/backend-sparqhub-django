@@ -164,6 +164,11 @@ STORAGES = {
     },
 }
 
+# Note: DATA_UPLOAD_MAX_MEMORY_SIZE (Django default 2.5MB) does not apply
+# here — that setting excludes multipart file upload data, only bounding
+# non-file POST fields.
+PROJECT_FILE_MAX_SIZE_BYTES = config('PROJECT_FILE_MAX_SIZE_BYTES', default=20 * 1024 * 1024, cast=int)
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 _REDIS_URL = config('REDIS_URL', default='redis://redis:6379/0')
