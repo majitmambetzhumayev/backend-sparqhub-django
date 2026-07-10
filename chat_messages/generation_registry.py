@@ -52,6 +52,11 @@ def is_active(thread_id: int) -> bool:
     return thread_id in _active
 
 
+def get_task(thread_id: int) -> asyncio.Task | None:
+    gen = _active.get(thread_id)
+    return gen.task if gen is not None else None
+
+
 def set_pending_confirmation(thread_id: int, future: asyncio.Future, tool: str, arguments: dict) -> None:
     gen = _active.get(thread_id)
     if gen is not None:

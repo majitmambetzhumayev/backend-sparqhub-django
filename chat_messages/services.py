@@ -125,13 +125,20 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         finally:
             generation_registry.clear_pending_confirmation(thread.id)
 
+    # Defined before the try, not inside it, so the except asyncio.CancelledError
+    # branch below can reference them safely even if cancellation strikes
+    # before send_chat_message() itself has returned (i.e. before any of
+    # these would otherwise have been assigned).
+    collected: list[str] = []
+    usage = None
+    used_global_key = False
+
     try:
         chunks, usage, used_global_key = await send_chat_message(
             thread.assistant, text, ai_provider=thread.ai_provider, model=thread.model, user=user,
             conversation_history=history, memories=memories, stream=True, project_id=thread.project_id,
             on_tool_call=track_tool_call, confirm_tool_call=confirm_tool_call,
         )
-        collected = []
         async for chunk in chunks:
             collected.append(chunk)
             await channel_layer.group_send(group_name, {"type": "chat.chunk", "chunk": chunk})
@@ -141,6 +148,22 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
             await deduct_credits(user, thread.ai_provider, thread.model, usage)
     except InsufficientCreditsError as exc:
         await channel_layer.group_send(group_name, {"type": "chat.error", "error": str(exc)})
+        return
+    except asyncio.CancelledError:
+        # ConversationConsumer._stop_generation cancelling the registered
+        # task — a deliberate user action, not a failure. Whatever was
+        # already generated is saved (same treatment as a normal
+        # completion) rather than discarded, so the partial response the
+        # user was reading doesn't vanish on reload. Deliberately not
+        # re-raised: this is a graceful, handled stop, not an unexpected
+        # crash, so the task should finish in a normal (not cancelled)
+        # state — nothing awaits it anyway (see ConversationConsumer).
+        if collected:
+            assistant_text = "".join(collected)
+            await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls)
+            if used_global_key:
+                await deduct_credits(user, thread.ai_provider, thread.model, usage)
+        await channel_layer.group_send(group_name, {"type": "chat.done", "thread_id": thread.id, "stopped": True})
         return
     except Exception:
         logger.exception("Error while streaming chat response for thread %s", thread.id)

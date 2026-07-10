@@ -696,6 +696,71 @@ class ConversationConsumerTest(TransactionTestCase):
         self.assertEqual(resurfaced_frame["arguments"], {"provider": "gemini"})
         self.assertEqual(first_chunk, {"chunk": "Confirmed!"})
 
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
+    def test_stop_generation_saves_partial_text_and_unblocks_thread(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        async def fake_send_chat_message(*args, **kwargs):
+            async def fake_chunks():
+                yield "Hello"
+                # Blocks "generating" indefinitely — stop_generation must
+                # interrupt this, not wait it out.
+                await asyncio.Event().wait()
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            await communicator.receive_json_from()  # thinking
+            chunk_frame = await communicator.receive_json_from()  # "Hello"
+
+            await communicator.send_json_to({"type": "stop_generation", "thread_id": self.existing_thread.id})
+            done_frame = await communicator.receive_json_from()
+
+            await communicator.disconnect()
+            return chunk_frame, done_frame
+
+        chunk_frame, done_frame = run(scenario())
+        self.assertEqual(chunk_frame, {"chunk": "Hello"})
+        self.assertEqual(done_frame, {"done": True, "thread_id": self.existing_thread.id, "stopped": True})
+
+        self.assertEqual(Message.objects.filter(thread=self.existing_thread).count(), 2)
+        self.existing_thread.refresh_from_db()
+        self.assertEqual(
+            self.existing_thread.conversation_state[-1],
+            {"role": "assistant", "content": "Hello"},
+        )
+        # The registry entry must be released, or a later message on this
+        # thread would be rejected forever.
+        self.assertFalse(generation_registry.is_active(self.existing_thread.id))
+
+    def test_stop_generation_rejects_a_thread_belonging_to_another_user(self):
+        other_user = User.objects.create_user(username="otheruser2", password="pass")
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = other_user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"type": "stop_generation", "thread_id": self.existing_thread.id})
+            frame = await communicator.receive_json_from()
+            await communicator.disconnect()
+            return frame
+
+        frame = run(scenario())
+        self.assertIn("error", frame)
+
     def test_call_cleans_up_group_membership_even_if_dispatch_crashes(self):
         # Channels' own dispatch loop only catches StopConsumer — any other
         # exception (e.g. the transient Redis read-timeout crash observed in
