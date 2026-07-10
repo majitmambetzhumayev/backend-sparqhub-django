@@ -74,6 +74,7 @@ INSTALLED_APPS = [
     'threads',
     'chat_messages',
     'librarian',
+    'project_files',
     'keys',
     'mcp_server',
     'mcp_client',
