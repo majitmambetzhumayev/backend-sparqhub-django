@@ -11,9 +11,8 @@ from .models import MCPServer
 def _is_safe_sse_url(url: str) -> bool:
     """Rejects SSE MCP server URLs that would make this backend's own network
     stack connect to a non-public host (cloud metadata endpoints, internal
-    services, loopback, etc.) — the stdio transport running a user's own
-    command is an accepted feature, but SSE means *this server* makes the
-    outbound connection, on the user's behalf, to wherever they point it."""
+    services, loopback, etc.) — SSE means *this server* makes the outbound
+    connection, on the user's behalf, to wherever they point it."""
     parsed = urlparse(url)
     if parsed.scheme not in ('http', 'https') or not parsed.hostname:
         return False
@@ -54,8 +53,23 @@ class MCPServerSerializer(serializers.ModelSerializer):
         transport = attrs.get('transport', getattr(self.instance, 'transport', 'stdio'))
         command = attrs.get('command', getattr(self.instance, 'command', ''))
         url = attrs.get('url', getattr(self.instance, 'url', ''))
-        if transport == 'stdio' and not command:
-            raise serializers.ValidationError({'command': 'Required for stdio transport.'})
+        if transport == 'stdio':
+            # stdio runs `command`/`args` as a subprocess on THIS backend,
+            # not the requesting user's machine — _get_mcp_context() spawns
+            # it on every chat turn in the project just to enumerate tools,
+            # unconditional on the LLM ever choosing to call one. Letting
+            # any authenticated user set an arbitrary command here is
+            # unauthenticated-adjacent remote code execution against the
+            # backend's own environment (DB credentials, provider API keys,
+            # everything else in settings). Restricted to staff, who are
+            # trusted to pre-configure specific tool servers.
+            request = self.context.get('request')
+            if not (request and request.user.is_staff):
+                raise serializers.ValidationError(
+                    {'transport': 'stdio transport is restricted to staff.'}
+                )
+            if not command:
+                raise serializers.ValidationError({'command': 'Required for stdio transport.'})
         if transport == 'sse':
             if not url:
                 raise serializers.ValidationError({'url': 'Required for sse transport.'})
