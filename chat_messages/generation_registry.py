@@ -17,9 +17,16 @@ from dataclasses import dataclass
 
 
 @dataclass
+class _PendingConfirmation:
+    future: asyncio.Future
+    tool: str
+    arguments: dict
+
+
+@dataclass
 class _Generation:
     task: asyncio.Task | None = None
-    confirmation_future: asyncio.Future | None = None
+    pending_confirmation: "_PendingConfirmation | None" = None
 
 
 _active: dict[int, _Generation] = {}
@@ -45,15 +52,31 @@ def is_active(thread_id: int) -> bool:
     return thread_id in _active
 
 
-def set_confirmation_future(thread_id: int, future: asyncio.Future | None) -> None:
+def set_pending_confirmation(thread_id: int, future: asyncio.Future, tool: str, arguments: dict) -> None:
     gen = _active.get(thread_id)
     if gen is not None:
-        gen.confirmation_future = future
+        gen.pending_confirmation = _PendingConfirmation(future=future, tool=tool, arguments=arguments)
+
+
+def clear_pending_confirmation(thread_id: int) -> None:
+    gen = _active.get(thread_id)
+    if gen is not None:
+        gen.pending_confirmation = None
 
 
 def get_confirmation_future(thread_id: int) -> asyncio.Future | None:
     gen = _active.get(thread_id)
-    return gen.confirmation_future if gen is not None else None
+    return gen.pending_confirmation.future if gen is not None and gen.pending_confirmation is not None else None
+
+
+def get_pending_confirmation(thread_id: int) -> _PendingConfirmation | None:
+    """The tool/arguments a still-active generation is waiting on approval
+    for, if any — used by ConversationConsumer._join_thread to re-broadcast
+    the confirm_required prompt to a client that (re)joins after it was
+    already sent once, rather than leaving them looking at a generic
+    "resuming" with no way to actually answer it."""
+    gen = _active.get(thread_id)
+    return gen.pending_confirmation if gen is not None else None
 
 
 def release(thread_id: int) -> None:

@@ -3,6 +3,7 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, patch
 
+from channels.consumer import AsyncConsumer
 from channels.testing import WebsocketCommunicator
 from django.contrib.auth import get_user_model
 from django.test import TransactionTestCase
@@ -641,6 +642,84 @@ class ConversationConsumerTest(TransactionTestCase):
 
         frame = run(scenario())
         self.assertIn("error", frame)
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
+    def test_join_thread_resurfaces_pending_confirmation(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # A reconnecting client (or a second tab) must be able to actually
+        # answer a confirmation that was broadcast before it joined, not
+        # just be told "resuming" with no way to act on it.
+        async def fake_send_chat_message(*args, **kwargs):
+            confirmed = await kwargs["confirm_tool_call"]("delegate_to_model", {"provider": "gemini"})
+
+            async def fake_chunks():
+                yield "Confirmed!" if confirmed else "Declined."
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            first = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            first.scope["user"] = self.user
+            connected, _ = await first.connect()
+            assert connected
+
+            await first.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            await first.receive_json_from()  # thinking
+            await first.receive_json_from()  # confirm_required (first delivery)
+
+            second = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            second.scope["user"] = self.user
+            connected2, _ = await second.connect()
+            assert connected2
+
+            await second.send_json_to({"type": "join_thread", "thread_id": self.existing_thread.id})
+            resurfaced_frame = await second.receive_json_from()
+
+            await second.send_json_to(
+                {"type": "tool_confirmation", "thread_id": resurfaced_frame["thread_id"], "confirmed": True},
+            )
+            first_chunk = await first.receive_json_from()
+
+            await first.disconnect()
+            await second.disconnect()
+            return resurfaced_frame, first_chunk
+
+        resurfaced_frame, first_chunk = run(scenario())
+        self.assertEqual(resurfaced_frame["status"], "confirm_required")
+        self.assertEqual(resurfaced_frame["tool"], "delegate_to_model")
+        self.assertEqual(resurfaced_frame["arguments"], {"provider": "gemini"})
+        self.assertEqual(first_chunk, {"chunk": "Confirmed!"})
+
+    def test_call_cleans_up_group_membership_even_if_dispatch_crashes(self):
+        # Channels' own dispatch loop only catches StopConsumer — any other
+        # exception (e.g. the transient Redis read-timeout crash observed in
+        # production) bypasses websocket.disconnect entirely, so
+        # disconnect()'s own cleanup never runs. __call__'s finally block is
+        # the safety net for that path specifically.
+        consumer = ConversationConsumer()
+        consumer.scope = {"user": self.user}
+        consumer.channel_layer = AsyncMock()
+        consumer.channel_name = "test-channel-x"
+
+        async def boom(*args, **kwargs):
+            consumer._joined_groups.add("thread_999")
+            raise RuntimeError("simulated crash in channel-layer dispatch")
+
+        async def scenario():
+            with patch.object(AsyncConsumer, "__call__", boom):
+                with self.assertRaises(RuntimeError):
+                    await consumer.__call__({}, None, None)
+
+        run(scenario())
+
+        consumer.channel_layer.group_discard.assert_awaited_once_with("thread_999", "test-channel-x")
+        self.assertEqual(consumer._joined_groups, set())
 
 
 class SendMessageAPICreditsTest(APITestCase):

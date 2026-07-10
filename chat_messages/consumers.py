@@ -16,11 +16,33 @@ logger = logging.getLogger(__name__)
 
 
 class ConversationConsumer(AsyncWebsocketConsumer):
+    async def __call__(self, scope, receive, send):
+        # Channels' own dispatch loop (AsyncConsumer.__call__) only catches
+        # StopConsumer — any other exception (e.g. a transient Redis read
+        # timeout crashing the channel-layer listen loop, observed
+        # repeatedly in production) propagates straight out, which means
+        # disconnect() below is *never called* for that exit path: it's only
+        # invoked in response to a proper websocket.disconnect ASGI message,
+        # which a crash bypasses entirely. Without this, a crashed
+        # connection's group memberships never get cleaned up and linger
+        # until Channels' own group_expiry (24h). Set unconditionally here
+        # (not in connect()) so it exists even if the crash happens before
+        # connect() ever runs.
+        self._joined_groups: set[str] = set()
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Safety net, not the primary path — disconnect() already does
+            # this on a clean disconnect, and this is then a no-op (empty
+            # set) by the time it runs.
+            for group_name in self._joined_groups:
+                await self.channel_layer.group_discard(group_name, self.channel_name)
+            self._joined_groups.clear()
+
     async def connect(self):
         if self.scope["user"].is_anonymous:
             await self.close(code=4001)
             return
-        self._joined_groups: set[str] = set()
         # Guards a rapid double-send of a brand-new thread (thread_id: None)
         # on THIS connection — generation_registry can't protect that case
         # itself (nothing to key a claim on before a thread exists, and each
@@ -120,7 +142,22 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         group_name = f"thread_{thread_id}"
         await self.channel_layer.group_add(group_name, self.channel_name)
         self._joined_groups.add(group_name)
-        if generation_registry.is_active(thread_id):
+        if not generation_registry.is_active(thread_id):
+            return
+        pending = generation_registry.get_pending_confirmation(thread_id)
+        if pending is not None:
+            # Re-send the same confirm_required prompt rather than a
+            # generic "resuming" — the original broadcast may have gone out
+            # while nobody (or a connection that's since dropped) was
+            # listening, and without this a client that reconnects has no
+            # way to actually answer it before the timeout.
+            await self._safe_send({
+                "status": "confirm_required",
+                "tool": pending.tool,
+                "arguments": pending.arguments,
+                "thread_id": thread_id,
+            })
+        else:
             await self._safe_send({"status": "resuming"})
 
     async def _safe_send(self, payload: dict) -> None:

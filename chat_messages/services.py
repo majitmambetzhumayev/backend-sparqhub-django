@@ -103,7 +103,13 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
 
     async def confirm_tool_call(tool_name, arguments):
         future = asyncio.get_event_loop().create_future()
-        generation_registry.set_confirmation_future(thread.id, future)
+        # tool/arguments stored alongside the future (not just the future
+        # itself) so a client that (re)joins after this broadcast already
+        # went out — e.g. reconnecting after the connection that would have
+        # seen it dropped — can be sent the same confirm_required prompt
+        # again via _join_thread, instead of only a generic "resuming" they
+        # have no way to act on.
+        generation_registry.set_pending_confirmation(thread.id, future, tool_name, arguments)
         # thread_id rides along so a client that doesn't know it yet (a
         # brand-new thread, mid-first-turn, before the 'done' frame ever
         # delivers an id) can still reply with the right thread_id.
@@ -117,7 +123,7 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
             logger.warning("Tool confirmation for thread %s timed out with no client attached", thread.id)
             return False
         finally:
-            generation_registry.set_confirmation_future(thread.id, None)
+            generation_registry.clear_pending_confirmation(thread.id)
 
     try:
         chunks, usage, used_global_key = await send_chat_message(
