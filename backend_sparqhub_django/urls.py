@@ -34,6 +34,9 @@ from projects.views import ProjectViewSet
 # MCP servers viewset
 from mcp_client.views import MCPServerViewSet
 
+# Project files viewset
+from project_files.views import ProjectFileViewSet
+
 # Threading and messaging
 # chat_messages/urls.py defines:
 #   path('threads/<int:thread_id>/messages/', SendMessageAPIView.as_view(), name='message-list')
@@ -72,6 +75,7 @@ router.register('assistants', AssistantViewSet, basename='assistant')
 router.register('apikeys', APIKeyViewSet, basename='apikey')
 router.register('projects', ProjectViewSet, basename='project')
 router.register('mcp-servers', MCPServerViewSet, basename='mcpserver')
+router.register('project-files', ProjectFileViewSet, basename='projectfile')
 router.register('admin/users', AdminUserViewSet, basename='admin-user')
 urlpatterns += [
     path('api/', include(router.urls)),
