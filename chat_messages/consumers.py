@@ -268,6 +268,8 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         payload = {"status": event["status"]}
         if "tool" in event:
             payload["tool"] = event["tool"]
+        if "provider" in event:
+            payload["provider"] = event["provider"]
         await self._safe_send(payload)
 
     async def chat_confirm_required(self, event):

@@ -142,14 +142,25 @@ DELEGATE_TOOL = {
 }
 
 
-def _build_delegate_tool(user, confirm_tool_call):
+def _build_delegate_tool(user, confirm_tool_call, on_tool_call=None, on_delegate_start=None):
     """Returns (tool_schema, executor) for the built-in delegate_to_model tool —
     always offered, regardless of the current provider, since its whole point
     is escalating to a DIFFERENT provider. Requires confirm_tool_call: this
     tool's entire premise is "asks the user first", so a caller with no way to
     ask (no confirm_tool_call provided) must fail closed rather than silently
     running unconfirmed — the delegated call itself is just a fresh, one-shot
-    send_chat_message with delegation disabled, so it can't recurse."""
+    send_chat_message with delegation disabled, so it can't recurse.
+
+    on_delegate_start and on_tool_call exist because the delegated call used
+    to run completely silently from the client's perspective: once confirmed,
+    nothing was reported again until the whole nested send_chat_message call
+    (a full LLM round-trip, plus whatever tools *it* decides to use, e.g.
+    generate_image) finished or failed — the status just sat on "thinking"
+    the entire time, indistinguishable from a normal short pause.
+    on_delegate_start reports which provider is now being waited on;
+    on_tool_call is threaded through to the nested call so its own tool
+    activity (e.g. an image-generation attempt) is visible too, not just the
+    outer model's."""
 
     async def executor(arguments: dict) -> str:
         if confirm_tool_call is None:
@@ -176,11 +187,14 @@ def _build_delegate_tool(user, confirm_tool_call):
         requested_model = arguments.get("model")
         target_model = requested_model if requested_model in available_models else available_models[0]
 
+        if on_delegate_start is not None:
+            await on_delegate_start(PROVIDERS[target_provider].label)
+
         sub_assistant = SimpleNamespace(instructions="You are a helpful assistant.")
         try:
             sub_result, sub_usage, sub_used_global_key = await send_chat_message(
                 sub_assistant, prompt, ai_provider=target_provider, model=target_model, user=user,
-                stream=False, allow_delegation=False,
+                stream=False, allow_delegation=False, on_tool_call=on_tool_call,
             )
         except Exception as exc:
             logger.exception("Delegated call to %s/%s failed", target_provider, target_model)
@@ -255,6 +269,7 @@ async def send_chat_message(
     project_id=None,
     on_tool_call=None,
     confirm_tool_call=None,
+    on_delegate_start=None,
     allow_delegation: bool = True,
 ):
     from keys.services import get_user_api_key
@@ -289,7 +304,9 @@ async def send_chat_message(
                 tools = [*tools, image_tool]
 
             if allow_delegation:
-                delegate_tool, delegate_executor = _build_delegate_tool(user, confirm_tool_call)
+                delegate_tool, delegate_executor = _build_delegate_tool(
+                    user, confirm_tool_call, on_tool_call=on_tool_call, on_delegate_start=on_delegate_start,
+                )
                 tools = [*tools, delegate_tool]
             else:
                 delegate_tool, delegate_executor = None, None

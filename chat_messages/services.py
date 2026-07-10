@@ -101,6 +101,14 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         tool_calls.append(tool_name)
         await channel_layer.group_send(group_name, {"type": "chat.status", "status": "tool_call", "tool": tool_name})
 
+    async def track_delegate_start(provider_label):
+        # The delegated call (a fresh, one-shot send_chat_message) used to
+        # run completely silently — status just sat on "thinking" for the
+        # whole round-trip, indistinguishable from a normal short pause.
+        await channel_layer.group_send(
+            group_name, {"type": "chat.status", "status": "delegating", "provider": provider_label},
+        )
+
     async def confirm_tool_call(tool_name, arguments):
         future = asyncio.get_event_loop().create_future()
         # tool/arguments stored alongside the future (not just the future
@@ -137,7 +145,7 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         chunks, usage, used_global_key = await send_chat_message(
             thread.assistant, text, ai_provider=thread.ai_provider, model=thread.model, user=user,
             conversation_history=history, memories=memories, stream=True, project_id=thread.project_id,
-            on_tool_call=track_tool_call, confirm_tool_call=confirm_tool_call,
+            on_tool_call=track_tool_call, confirm_tool_call=confirm_tool_call, on_delegate_start=track_delegate_start,
         )
         async for chunk in chunks:
             collected.append(chunk)
