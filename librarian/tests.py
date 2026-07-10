@@ -25,7 +25,7 @@ class EmbedTest(TestCase):
     def _mock_response(vector):
         return MagicMock(data=[MagicMock(embedding=vector)])
 
-    @patch('librarian.services.Mistral')
+    @patch('core.embeddings.Mistral')
     def test_embed_calls_mistral_embeddings_api(self, mock_mistral_cls):
         mock_client = MagicMock()
         mock_client.embeddings.create.return_value = self._mock_response([0.1] * 1024)
@@ -36,7 +36,7 @@ class EmbedTest(TestCase):
         mock_client.embeddings.create.assert_called_once_with(model='mistral-embed', inputs=['hello'])
         self.assertEqual(len(result), 1024)
 
-    @patch('librarian.services.Mistral')
+    @patch('core.embeddings.Mistral')
     def test_store_memory_persists_the_embedding(self, mock_mistral_cls):
         mock_client = MagicMock()
         mock_client.embeddings.create.return_value = self._mock_response([0.2] * 1024)
@@ -48,7 +48,7 @@ class EmbedTest(TestCase):
         self.assertEqual(entry.content, "likes hiking")
         self.assertEqual(len(entry.embedding), 1024)
 
-    @patch('librarian.services.Mistral')
+    @patch('core.embeddings.Mistral')
     def test_retrieve_relevant_memories_orders_by_similarity(self, mock_mistral_cls):
         mock_client = MagicMock()
         mock_client.embeddings.create.side_effect = [

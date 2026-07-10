@@ -1,11 +1,8 @@
-from functools import lru_cache
-
 from asgiref.sync import sync_to_async
-from django.conf import settings
-from mistralai.client import Mistral
 from pgvector.django import CosineDistance
 
 from ai_providers.factory import provider_session
+from core.embeddings import embed as _embed, get_embed_client as _get_embed_client
 
 from .models import MemoryEntry
 
@@ -18,23 +15,11 @@ _EXTRACTION_SYSTEM_PROMPT = (
 
 # Fixed to one provider/model regardless of a thread's chosen chat provider —
 # every user's memories must land in the same vector space to be comparable
-# via CosineDistance. Paid for on the app's own Mistral key, not a user's
-# BYOK key or credits — this is internal infra, not a user-requested AI
-# response. mistral-embed doesn't support output_dimension truncation
-# (confirmed via a live call, its docs are ambiguous on this) — outputs a
-# fixed 1024 dims, matching MemoryEntry.embedding's VectorField.
-_EMBED_MODEL = 'mistral-embed'
+# via CosineDistance, and every embedding consumer (memories, project file
+# chunks) shares the same client/model — see core/embeddings.py. Paid for
+# on the app's own Mistral key, not a user's BYOK key or credits — this is
+# internal infra, not a user-requested AI response.
 _TOP_K = 5
-
-
-@lru_cache(maxsize=1)
-def _get_embed_client() -> Mistral:
-    return Mistral(api_key=settings.MISTRAL_API_KEY)
-
-
-def _embed(text: str) -> list[float]:
-    response = _get_embed_client().embeddings.create(model=_EMBED_MODEL, inputs=[text])
-    return response.data[0].embedding
 
 
 def store_memory(user, content: str) -> MemoryEntry:

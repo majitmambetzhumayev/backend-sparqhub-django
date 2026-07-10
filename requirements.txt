@@ -16,8 +16,11 @@ mcp>=1.2.0
 mistralai
 openai
 pgvector
+Pillow
 psycopg2-binary
+pypdf
 python-decouple
+python-docx
 resend
 sentry-sdk
 uvicorn[standard]

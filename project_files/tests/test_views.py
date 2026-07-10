@@ -20,8 +20,9 @@ class ProjectFileCRUDAPITest(APITestCase):
         self.project = Project.objects.create(user=self.user, name='Research')
         self.url = reverse('projectfile-list')
 
+    @patch('project_files.tasks.process_project_file_task.delay')
     @patch('project_files.services.default_storage')
-    def test_upload_success(self, mock_storage):
+    def test_upload_success(self, mock_storage, mock_delay):
         mock_storage.save.return_value = 'project_files/x.txt'
         mock_storage.url.return_value = 'https://pub-x.r2.dev/project_files/x.txt'
         uploaded = SimpleUploadedFile('notes.txt', b'hello world', content_type='text/plain')
@@ -32,6 +33,7 @@ class ProjectFileCRUDAPITest(APITestCase):
         self.assertEqual(response.data['original_filename'], 'notes.txt')
         self.assertEqual(response.data['status'], 'pending')
         self.assertTrue(ProjectFile.objects.filter(project=self.project, original_filename='notes.txt').exists())
+        mock_delay.assert_called_once()
 
     @override_settings(PROJECT_FILE_MAX_SIZE_BYTES=10)
     def test_oversized_file_rejected(self):
