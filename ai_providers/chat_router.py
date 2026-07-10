@@ -71,6 +71,45 @@ async def _get_mcp_context(project_id) -> tuple[list[dict], object]:
     return all_tools, tool_executor
 
 
+FILE_SEARCH_TOOL = {
+    "name": "search_project_files",
+    "description": (
+        "Search the files uploaded to this project (PDFs, text/markdown notes, Word docs) for "
+        "relevant passages. Use this when the user asks about the content of something they've "
+        "uploaded to this project."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "What to search for."}},
+        "required": ["query"],
+    },
+}
+
+
+async def _build_file_search_tool(project_id):
+    """Returns (tool_schema, executor) for the built-in search_project_files
+    tool, or (None, None) when the project has no embedded chunks ready yet
+    — same reasoning as _get_mcp_context skipping an empty server list: the
+    model should never be offered a search tool that's guaranteed to return
+    nothing. A tool call, not eager context injection like memories — file
+    content is bulkier and only occasionally relevant, unlike short memory
+    facts that are cheap to always include."""
+    from project_files.services import project_has_searchable_files, search_project_files
+
+    if project_id is None:
+        return None, None
+    if not await sync_to_async(project_has_searchable_files)(project_id):
+        return None, None
+
+    async def executor(arguments: dict) -> str:
+        results = await sync_to_async(search_project_files)(project_id, arguments.get("query", ""))
+        if not results:
+            return "No relevant content found in this project's files."
+        return "\n\n".join(f"[{r.filename}, chunk {r.chunk_index}]\n{r.content}" for r in results)
+
+    return FILE_SEARCH_TOOL, executor
+
+
 IMAGE_GENERATION_TOOL = {
     "name": "generate_image",
     "description": "Generate an image from a text prompt and return a URL to the generated image.",
@@ -303,6 +342,10 @@ async def send_chat_message(
             if image_tool is not None:
                 tools = [*tools, image_tool]
 
+            file_search_tool, file_search_executor = await _build_file_search_tool(project_id)
+            if file_search_tool is not None:
+                tools = [*tools, file_search_tool]
+
             if allow_delegation:
                 delegate_tool, delegate_executor = _build_delegate_tool(
                     user, confirm_tool_call, on_tool_call=on_tool_call, on_delegate_start=on_delegate_start,
@@ -314,6 +357,8 @@ async def send_chat_message(
             async def combined_executor(name: str, arguments: dict) -> str:
                 if image_tool is not None and name == "generate_image":
                     return await image_executor(arguments)
+                if file_search_tool is not None and name == "search_project_files":
+                    return await file_search_executor(arguments)
                 if delegate_tool is not None and name == "delegate_to_model":
                     return await delegate_executor(arguments)
                 if mcp_executor is not None:

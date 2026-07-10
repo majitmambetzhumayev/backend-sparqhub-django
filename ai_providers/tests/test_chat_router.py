@@ -10,6 +10,7 @@ from ai_providers.factory import PROVIDERS
 from ai_providers.chat_router import (
     InsufficientCreditsError,
     _build_delegate_tool,
+    _build_file_search_tool,
     _build_image_tool,
     _compute_cost_credits,
     _get_mcp_context,
@@ -21,6 +22,7 @@ from projects.models import Project
 from mcp_client.models import MCPServer
 from image_providers.base import ImageResult
 from image_providers.openai_image.provider import OpenAIImageProvider
+from project_files.models import ProjectFile, ProjectFileChunk
 
 User = get_user_model()
 
@@ -205,6 +207,52 @@ class GetMcpContextTest(TransactionTestCase):
         mock_call_tool.assert_awaited_once_with(first, 'search', {})
 
 
+class BuildFileSearchToolTest(TransactionTestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='filesearchuser', password='pass')
+        self.project = Project.objects.create(user=self.user, name='Research')
+
+    def test_returns_none_when_no_project(self):
+        tool, executor = run(_build_file_search_tool(None))
+        self.assertIsNone(tool)
+        self.assertIsNone(executor)
+
+    def test_returns_none_when_project_has_no_searchable_chunks(self):
+        tool, executor = run(_build_file_search_tool(self.project.id))
+        self.assertIsNone(tool)
+        self.assertIsNone(executor)
+
+    def test_returns_tool_and_working_executor_when_chunks_exist(self):
+        file_obj = ProjectFile.objects.create(
+            project=self.project, original_filename='notes.txt', content_type='text/plain', size_bytes=1,
+            storage_key='project_files/notes.txt', status='ready',
+        )
+        ProjectFileChunk.objects.create(
+            file=file_obj, project=self.project, chunk_index=0, content='relevant passage', embedding=[0.0] * 1024,
+        )
+
+        tool, executor = run(_build_file_search_tool(self.project.id))
+
+        self.assertEqual(tool['name'], 'search_project_files')
+        with patch('project_files.services.embed', return_value=[0.0] * 1024):
+            result = run(executor({'query': 'anything'}))
+        self.assertIn('relevant passage', result)
+        self.assertIn('notes.txt', result)
+
+    def test_executor_reports_no_results_found(self):
+        file_obj = ProjectFile.objects.create(
+            project=self.project, original_filename='notes.txt', content_type='text/plain', size_bytes=1,
+            storage_key='project_files/notes.txt', status='ready',
+        )
+        ProjectFileChunk.objects.create(
+            file=file_obj, project=self.project, chunk_index=0, content='relevant passage', embedding=[0.0] * 1024,
+        )
+        with patch('project_files.services.search_project_files', return_value=[]):
+            tool, executor = run(_build_file_search_tool(self.project.id))
+            result = run(executor({'query': 'anything'}))
+        self.assertIn('No relevant content', result)
+
+
 class BuildImageToolTest(TransactionTestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='imageuser', password='pass', credits_remaining=100)
@@ -313,6 +361,71 @@ class SendChatMessageImageToolTest(TransactionTestCase):
         tool_names = [t['name'] for t in mock_run_loop.call_args.args[4]]
         self.assertNotIn('generate_image', tool_names)
         self.assertIn('delegate_to_model', tool_names)
+
+
+class SendChatMessageFileSearchToolTest(TransactionTestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='filesearchtooluser', password='pass', credits_remaining=100)
+        self.project = Project.objects.create(user=self.user, name='Research')
+
+    @patch('ai_providers.chat_router.get_provider')
+    @patch('ai_providers.chat_router.run_agent_loop', new_callable=AsyncMock, return_value='Hi there!')
+    @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
+    def test_includes_file_search_tool_when_project_has_searchable_files(
+        self, mock_get_key, mock_run_loop, mock_get_provider,
+    ):
+        assistant = Assistant.objects.create(
+            user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
+        )
+        file_obj = ProjectFile.objects.create(
+            project=self.project, original_filename='notes.txt', content_type='text/plain', size_bytes=1,
+            storage_key='project_files/notes.txt', status='ready',
+        )
+        ProjectFileChunk.objects.create(
+            file=file_obj, project=self.project, chunk_index=0, content='hello', embedding=[0.0] * 1024,
+        )
+        mock_get_provider.return_value = _mock_provider()
+
+        run(send_chat_message(
+            assistant, 'What does my file say?', ai_provider='anthropic', model='claude-sonnet-5',
+            user=self.user, project_id=self.project.id,
+        ))
+
+        tool_names = [t['name'] for t in mock_run_loop.call_args.args[4]]
+        self.assertIn('search_project_files', tool_names)
+
+    @patch('ai_providers.chat_router.get_provider')
+    @patch('ai_providers.chat_router.run_agent_loop', new_callable=AsyncMock, return_value='Hi there!')
+    @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
+    def test_omits_file_search_tool_when_project_has_no_searchable_files(
+        self, mock_get_key, mock_run_loop, mock_get_provider,
+    ):
+        assistant = Assistant.objects.create(
+            user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
+        )
+        mock_get_provider.return_value = _mock_provider()
+
+        run(send_chat_message(
+            assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5',
+            user=self.user, project_id=self.project.id,
+        ))
+
+        tool_names = [t['name'] for t in mock_run_loop.call_args.args[4]]
+        self.assertNotIn('search_project_files', tool_names)
+
+    @patch('ai_providers.chat_router.get_provider')
+    @patch('ai_providers.chat_router.run_agent_loop', new_callable=AsyncMock, return_value='Hi there!')
+    @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
+    def test_omits_file_search_tool_when_no_project(self, mock_get_key, mock_run_loop, mock_get_provider):
+        assistant = Assistant.objects.create(
+            user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
+        )
+        mock_get_provider.return_value = _mock_provider()
+
+        run(send_chat_message(assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user))
+
+        tool_names = [t['name'] for t in mock_run_loop.call_args.args[4]]
+        self.assertNotIn('search_project_files', tool_names)
 
 
 class BuildDelegateToolTest(TransactionTestCase):
