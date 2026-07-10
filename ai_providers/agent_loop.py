@@ -1,3 +1,15 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
+# A model that keeps requesting tools without ever converging (e.g. asked to
+# inspect an uploaded image through a text-only search tool, and never gives
+# up) would otherwise loop here forever — nothing else in a turn's lifecycle
+# bounds tool-call rounds specifically (CONFIRMATION_TIMEOUT_SECONDS in
+# chat_messages/services.py only bounds a pending user confirmation).
+MAX_TOOL_ITERATIONS = 15
+
+
 async def run_agent_loop(
     provider, assistant, messages, system, tools, tool_executor,
     initial_response=None, usage=None, on_tool_call=None,
@@ -21,7 +33,12 @@ async def run_agent_loop(
         response = await provider.complete(assistant, messages, system, tools)
         if usage is not None and response.usage:
             usage.add(**response.usage)
+    iterations = 0
     while response.requires_tool_execution and tool_executor:
+        iterations += 1
+        if iterations > MAX_TOOL_ITERATIONS:
+            logger.warning("Agent loop exceeded %s tool-call iterations, stopping", MAX_TOOL_ITERATIONS)
+            return "I wasn't able to finish this after several tool calls — could you rephrase or narrow your request?"
         results = []
         for call in response.tool_calls:
             if on_tool_call is not None:
