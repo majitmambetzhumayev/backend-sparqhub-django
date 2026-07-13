@@ -471,6 +471,61 @@ class ConversationConsumerTest(TransactionTestCase):
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message", new_callable=AsyncMock)
+    @patch("chat_messages.consumers.get_or_create_thread")
+    def test_releases_claim_and_sends_error_on_unexpected_failure_before_generation_starts(
+        self, mock_get_thread, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # Regression test: a gap one step earlier than the memory-retrieval
+        # incident above — anything unexpected between claiming the thread
+        # (try_claim in receive()) and handing off to run_and_broadcast_turn
+        # (get_or_create_thread raising something other than
+        # Thread.DoesNotExist, group_add hitting a transient Redis blip,
+        # etc.) used to propagate out of this un-awaited task uncaught,
+        # leaking the generation_registry claim forever — every subsequent
+        # message on that thread would be rejected as "still processing"
+        # with no way to recover short of a server restart.
+        mock_get_thread.side_effect = RuntimeError("db connection blip")
+
+        async def fake_chunks():
+            yield "Hi again yourself."
+
+        mock_send.return_value = (fake_chunks(), None, False)
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            error_frame = await communicator.receive_json_from()
+
+            # The claim must be released — a second attempt on the same
+            # thread should be accepted (not rejected as "still processing"),
+            # proving generation_registry no longer thinks a generation is
+            # in flight for it.
+            mock_get_thread.side_effect = None
+            mock_get_thread.return_value = self.existing_thread
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi again"})
+            second_frame = await communicator.receive_json_from()
+
+            await communicator.disconnect()
+            return error_frame, second_frame
+
+        error_frame, second_frame = run(scenario())
+        self.assertEqual(
+            error_frame, {"error": "Something went wrong while starting the response. Please try again."},
+        )
+        # A rejected-as-still-processing claim would arrive as an "error"
+        # frame synchronously, before any "thinking" status — getting to
+        # "thinking" proves try_claim succeeded, i.e. the earlier claim was
+        # actually released.
+        self.assertEqual(second_frame, {"status": "thinking"})
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
     @patch("chat_messages.services.send_chat_message")
     def test_pauses_for_confirmation_and_resumes_when_confirmed(
         self, mock_send, mock_memories, mock_extract_task, mock_title_task,
