@@ -243,7 +243,17 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(group_name, self.channel_name)
         self._joined_groups.add(group_name)
 
-        memories = await sync_to_async(retrieve_relevant_memories)(user, message_text)
+        try:
+            memories = await sync_to_async(retrieve_relevant_memories)(user, message_text)
+        except Exception:
+            # Memory recall is a supplementary enrichment, not the core
+            # feature — degrade gracefully (e.g. a corrupted/mismatched
+            # embedding row for this user) rather than losing the whole turn
+            # to an unhandled task exception, which previously left the
+            # thread claimed forever in generation_registry with no
+            # chat.error ever reaching the client (silent, permanent hang).
+            logger.exception("Failed to retrieve memories for user %s; continuing without them", user.id)
+            memories = []
         await self.channel_layer.group_send(group_name, {"type": "chat.status", "status": "thinking"})
 
         try:

@@ -428,6 +428,48 @@ class ConversationConsumerTest(TransactionTestCase):
 
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories")
+    @patch("chat_messages.services.send_chat_message")
+    def test_completes_turn_when_memory_retrieval_fails(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # Regression test: retrieve_relevant_memories used to be called with
+        # no try/except around a fire-and-forget task — an exception there
+        # (hit live via a stale/mismatched embedding dimension) killed the
+        # task silently, with no chat.error ever reaching the client and the
+        # thread's generation_registry claim never released. Memory recall
+        # is supplementary, not core, so a failure there must degrade
+        # gracefully rather than take down the whole turn.
+        mock_memories.side_effect = RuntimeError("vector dimension mismatch")
+
+        async def fake_chunks():
+            yield "Hi there."
+
+        mock_send.return_value = (fake_chunks(), None, False)
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": None, "message": "Hi"})
+            thinking_frame = await communicator.receive_json_from()
+            chunk_frame = await communicator.receive_json_from()
+            done_frame = await communicator.receive_json_from()
+
+            await communicator.disconnect()
+            return thinking_frame, chunk_frame, done_frame
+
+        thinking_frame, chunk_frame, done_frame = run(scenario())
+        self.assertEqual(thinking_frame, {"status": "thinking"})
+        self.assertEqual(chunk_frame, {"chunk": "Hi there."})
+        self.assertTrue(done_frame["done"])
+        # memories=[] was passed through despite the retrieval failure.
+        self.assertEqual(mock_send.call_args.kwargs["memories"], [])
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
     @patch("chat_messages.services.send_chat_message")
     def test_pauses_for_confirmation_and_resumes_when_confirmed(

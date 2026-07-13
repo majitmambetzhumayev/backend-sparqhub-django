@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 from django.test import SimpleTestCase
 
-from ai_providers.agent_loop import run_agent_loop
+from ai_providers.agent_loop import MAX_TOOL_ITERATIONS, run_agent_loop
 from ai_providers.base import ProviderResponse, ToolCall, UsageAccumulator
 
 
@@ -91,3 +91,17 @@ class RunAgentLoopTest(SimpleTestCase):
 
         self.assertEqual(usage.input_tokens, 250)
         self.assertEqual(usage.output_tokens, 50)
+
+    def test_stops_after_max_tool_iterations_instead_of_looping_forever(self):
+        # A model that never converges (keeps requesting tools every round)
+        # must not hang the turn indefinitely.
+        never_converges = ProviderResponse(text='', tool_calls=[ToolCall(id='1', name='search', arguments={})])
+        provider = MagicMock()
+        provider.complete = AsyncMock(return_value=never_converges)
+        provider.append_turn = MagicMock(return_value=[])
+        tool_executor = AsyncMock(return_value='result')
+
+        result = run(run_agent_loop(provider, MagicMock(), [], 'sys', [], tool_executor))
+
+        self.assertEqual(provider.complete.call_count, MAX_TOOL_ITERATIONS + 1)
+        self.assertIn("wasn't able to finish", result)
