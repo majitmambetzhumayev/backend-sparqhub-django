@@ -26,9 +26,12 @@ def get_or_create_thread(user, thread_id=None, ai_provider=None, model=None, pro
     if model:
         kwargs['model'] = model
     if project_id:
-        project = Project.objects.filter(pk=project_id, user=user).first()
-        if project:
-            kwargs['project'] = project
+        # .get() (not .filter().first()) deliberately — a project_id that
+        # doesn't exist or belongs to another user must be rejected, not
+        # silently dropped. It used to fall through here with the thread
+        # simply created project-less, a 200 the caller had no way to tell
+        # apart from "no project_id was ever sent."
+        kwargs['project'] = Project.objects.get(pk=project_id, user=user)
     thread = Thread.objects.create(user=user, assistant=assistant, conversation_state=[], **kwargs)
     thread.assistant
     return thread

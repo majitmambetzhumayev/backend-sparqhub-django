@@ -10,6 +10,7 @@ from chat_messages.models import Message
 from chat_messages.serializers import MessageSerializer
 from chat_messages.services import send_message
 from librarian.services import retrieve_relevant_memories
+from projects.models import Project
 from threads.models import Thread
 from threads.services import get_or_create_thread
 
@@ -50,6 +51,8 @@ class SendMessageAPIView(APIView):
             )
         except Thread.DoesNotExist:
             return Response({"error": "Thread not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Project.DoesNotExist:
+            return Response({"error": "Project not found."}, status=status.HTTP_404_NOT_FOUND)
 
         memories = retrieve_relevant_memories(user, text)
         try:

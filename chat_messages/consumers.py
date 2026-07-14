@@ -9,6 +9,7 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 from chat_messages import generation_registry
 from chat_messages.services import run_and_broadcast_turn
 from librarian.services import retrieve_relevant_memories
+from projects.models import Project
 from threads.models import Thread
 from threads.services import get_or_create_thread
 
@@ -229,6 +230,11 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                 if thread_id is not None:
                     generation_registry.release(thread_id)
                 await self._safe_send({"error": "Thread not found."})
+                return
+            except Project.DoesNotExist:
+                if thread_id is not None:
+                    generation_registry.release(thread_id)
+                await self._safe_send({"error": "Project not found."})
                 return
 
             if thread_id is None:
