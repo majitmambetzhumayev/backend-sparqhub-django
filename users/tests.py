@@ -56,6 +56,17 @@ class JWTAuthMiddlewareTest(TransactionTestCase):
     def test_invalid_token_resolves_anonymous(self):
         self.assertIsInstance(self._resolved_user("access_token=garbage"), AnonymousUser)
 
+    def test_unexpected_error_resolves_anonymous_but_is_logged(self):
+        # Regression test: this file used to have no logger at all — an
+        # expired/malformed token (expected) and a genuine bug (e.g. a DB
+        # error resolving the user) were completely indistinguishable, with
+        # zero trace either way.
+        token = str(AccessToken.for_user(self.user))
+        with patch("users.ws_auth.CookieJWTAuthentication.get_user", side_effect=RuntimeError("db blip")):
+            with self.assertLogs("users.ws_auth", level="ERROR"):
+                user = self._resolved_user(f"access_token={token}")
+        self.assertIsInstance(user, AnonymousUser)
+
 
 class AuthCookieDomainTest(APITestCase):
     # Regression tests: a cookie set with no `domain` is host-only (scoped
@@ -410,7 +421,12 @@ class OAuthCallbackViewTest(APITestCase):
         mock_client.authorize_access_token.side_effect = OAuthError(error='access_denied')
         mock_oauth.create_client.return_value = mock_client
 
-        response = self.client.get(reverse('oauth-callback', kwargs={'provider': 'google'}))
+        # Regression test: this failure used to be caught with no logging at
+        # all — a misconfigured client secret and a user simply cancelling
+        # the consent screen were completely indistinguishable, with zero
+        # trace either way.
+        with self.assertLogs('users.views', level='WARNING'):
+            response = self.client.get(reverse('oauth-callback', kwargs={'provider': 'google'}))
 
         self.assertEqual(response.status_code, status.HTTP_302_FOUND)
         self.assertIn('/auth/login', response.url)
