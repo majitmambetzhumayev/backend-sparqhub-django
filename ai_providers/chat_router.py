@@ -252,6 +252,15 @@ def _compute_cost_credits(provider_cls, model: str, usage: UsageAccumulator | No
         return 0
     pricing = provider_cls.PRICING.get(model)
     if not pricing:
+        # Real, successful, token-consuming usage with nowhere to price it —
+        # e.g. a model added to AVAILABLE_MODELS without a matching PRICING
+        # entry. Silently returning 0 here means genuine usage gets billed
+        # as free with zero trace; this is the one thing worth knowing about
+        # even though the turn itself succeeded.
+        logger.warning(
+            "No pricing entry for %s/%s — %s input / %s output tokens billed as free",
+            provider_cls.__name__, model, usage.input_tokens, usage.output_tokens,
+        )
         return 0
     cost_usd = (
         usage.input_tokens / 1_000_000 * pricing["input"]
