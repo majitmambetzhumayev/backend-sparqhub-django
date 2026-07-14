@@ -23,10 +23,10 @@ def process_project_file_task(file_id: int) -> None:
         logger.warning("process_project_file_task: file %s no longer exists", file_id)
         return
 
-    file_obj.status = 'processing'
-    file_obj.save(update_fields=['status', 'updated_at'])
-
     try:
+        file_obj.status = 'processing'
+        file_obj.save(update_fields=['status', 'updated_at'])
+
         data = default_storage.open(file_obj.storage_key).read()
         if file_obj.content_type in IMAGE_CONTENT_TYPES:
             thumb_key = save_uploaded_file_bytes(
