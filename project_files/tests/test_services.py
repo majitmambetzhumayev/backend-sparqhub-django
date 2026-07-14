@@ -56,11 +56,25 @@ class SaveUploadedFileBytesTest(TestCase):
     @patch('project_files.services.default_storage')
     def test_saves_under_project_files_prefix_with_matching_extension(self, mock_storage):
         mock_storage.save.return_value = 'project_files/some-uuid.pdf'
-        key = save_uploaded_file_bytes(b'%PDF-1.4...', 'report.pdf')
+        key = save_uploaded_file_bytes(b'%PDF-1.4...', 'report.pdf', 'application/pdf')
         self.assertEqual(key, 'project_files/some-uuid.pdf')
         args, _ = mock_storage.save.call_args
         self.assertTrue(args[0].startswith('project_files/'))
         self.assertTrue(args[0].endswith('.pdf'))
+
+    @patch('project_files.services.default_storage')
+    def test_sets_content_type_explicitly_instead_of_leaving_it_to_be_guessed(self, mock_storage):
+        # Regression test: mimetypes.guess_type(filename) — django-storages'
+        # fallback when a ContentFile has no .content_type of its own —
+        # resolves some accepted extensions (e.g. .webp) to None, which
+        # S3Storage then serves as "application/octet-stream": a type
+        # browsers are willing to content-sniff (including as text/html) on
+        # an origin with no nosniff header. content_type must always be set
+        # explicitly on the saved file, from the app's own resolved type.
+        save_uploaded_file_bytes(b'RIFF....WEBP', 'photo.webp', 'image/webp')
+        args, _ = mock_storage.save.call_args
+        saved_content = args[1]
+        self.assertEqual(saved_content.content_type, 'image/webp')
 
 
 class BuildStorageUrlTest(TestCase):

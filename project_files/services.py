@@ -42,14 +42,25 @@ def resolve_canonical_content_type(filename: str) -> str:
     return canonical
 
 
-def save_uploaded_file_bytes(data: bytes, filename: str) -> str:
+def save_uploaded_file_bytes(data: bytes, filename: str, content_type: str) -> str:
     """Mirrors image_providers/services.py::save_generated_image, but
     returns only the storage key (path) rather than a pre-built URL — the
     URL is derived on read (see build_storage_url) so it never goes stale
-    if R2's public domain ever changes."""
+    if R2's public domain ever changes.
+
+    content_type is set explicitly on the ContentFile (read by
+    django-storages' S3Storage as the object's stored Content-Type) rather
+    than left for mimetypes.guess_type(filename) to infer — that guess
+    falls through to "application/octet-stream" for some accepted
+    extensions (.webp confirmed), and a file served with that generic
+    type, with no nosniff header on R2's origin, is one browsers are
+    willing to content-sniff — including sniffing to text/html and
+    executing an uploaded file's bytes as script."""
     extension = Path(filename).suffix.lstrip('.').lower() or 'bin'
     key = f"project_files/{uuid.uuid4()}.{extension}"
-    return default_storage.save(key, ContentFile(data))
+    content = ContentFile(data)
+    content.content_type = content_type
+    return default_storage.save(key, content)
 
 
 def build_storage_url(storage_key: str) -> str:
@@ -66,11 +77,12 @@ def build_storage_url(storage_key: str) -> str:
 
 def create_project_file(project, uploaded_file) -> ProjectFile:
     data = uploaded_file.read()
-    storage_key = save_uploaded_file_bytes(data, uploaded_file.name)
+    canonical_content_type = resolve_canonical_content_type(uploaded_file.name)
+    storage_key = save_uploaded_file_bytes(data, uploaded_file.name, canonical_content_type)
     file_obj = ProjectFile.objects.create(
         project=project,
         original_filename=uploaded_file.name,
-        content_type=resolve_canonical_content_type(uploaded_file.name),
+        content_type=canonical_content_type,
         size_bytes=len(data),
         storage_key=storage_key,
     )
