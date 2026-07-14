@@ -11,7 +11,7 @@ from rest_framework.views import APIView
 from rest_framework import generics, mixins, status, viewsets
 from django.conf import settings
 from django.utils.decorators import method_decorator
-from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
+from django.views.decorators.csrf import csrf_exempt, csrf_protect, ensure_csrf_cookie
 
 from .oauth import oauth
 from .serializers import (
@@ -40,7 +40,7 @@ def _set_auth_cookies(response, access, refresh=None):
 
 
 @method_decorator(ensure_csrf_cookie, name='dispatch')
-@method_decorator(csrf_exempt, name='dispatch')
+@method_decorator(csrf_protect, name='dispatch')
 class CookieTokenObtainPairView(TokenObtainPairView):
     serializer_class = EmailVerifiedTokenObtainPairSerializer
 

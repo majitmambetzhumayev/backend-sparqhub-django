@@ -98,9 +98,7 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         msg_type = data.get("type")
 
         if msg_type == "tool_confirmation":
-            future = generation_registry.get_confirmation_future(data.get("thread_id"))
-            if future is not None and not future.done():
-                future.set_result(bool(data.get("confirmed")))
+            await self._confirm_tool(data.get("thread_id"), bool(data.get("confirmed")))
             return
 
         if msg_type == "join_thread":
@@ -169,6 +167,26 @@ class ConversationConsumer(AsyncWebsocketConsumer):
             })
         else:
             await self._safe_send({"status": "resuming"})
+
+    async def _confirm_tool(self, thread_id, confirmed: bool) -> None:
+        if thread_id is None:
+            return
+        user = self.scope["user"]
+        try:
+            # Same ownership check as _join_thread/_stop_generation —
+            # without it, any authenticated user could resolve another
+            # user's pending tool confirmation (e.g. approve/deny a
+            # delegate_to_model escalation on someone else's thread) just by
+            # guessing/enumerating thread_id, since generation_registry is
+            # keyed only by a plain integer with no ownership check of its
+            # own.
+            await sync_to_async(get_or_create_thread)(user, thread_id=thread_id)
+        except Thread.DoesNotExist:
+            await self._safe_send({"error": "Thread not found."})
+            return
+        future = generation_registry.get_confirmation_future(thread_id)
+        if future is not None and not future.done():
+            future.set_result(confirmed)
 
     async def _stop_generation(self, thread_id) -> None:
         if thread_id is None:
