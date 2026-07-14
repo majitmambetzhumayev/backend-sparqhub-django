@@ -34,13 +34,15 @@ def _make_part(function_call=None, thought_signature=None):
     return MagicMock(function_call=function_call, thought_signature=thought_signature)
 
 
-def _make_response(text=None, function_calls=None, thought_signatures=None, prompt_tokens=10, candidate_tokens=5):
+def _make_response(
+    text=None, function_calls=None, thought_signatures=None, prompt_tokens=10, candidate_tokens=5, finish_reason=None,
+):
     usage_metadata = MagicMock(prompt_token_count=prompt_tokens, candidates_token_count=candidate_tokens)
     function_calls = function_calls or []
     signatures = thought_signatures or [None] * len(function_calls)
     parts = [_make_part(function_call=fc, thought_signature=sig) for fc, sig in zip(function_calls, signatures)]
     content = MagicMock(parts=parts)
-    candidate = MagicMock(content=content)
+    candidate = MagicMock(content=content, finish_reason=MagicMock(value=finish_reason) if finish_reason else None)
     return MagicMock(text=text, function_calls=function_calls, usage_metadata=usage_metadata, candidates=[candidate])
 
 
@@ -107,6 +109,13 @@ class GeminiProviderCompleteTest(SimpleTestCase):
         )
         result = run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Hi'}], 'sys', None))
         self.assertEqual(result.usage, {'input_tokens': 42, 'output_tokens': 17})
+
+    def test_complete_captures_finish_reason(self):
+        self.provider.client.aio.models.generate_content = AsyncMock(
+            return_value=_make_response(text='Cut off...', finish_reason='MAX_TOKENS')
+        )
+        result = run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Hi'}], 'sys', None))
+        self.assertEqual(result.finish_reason, 'MAX_TOKENS')
 
     def test_complete_captures_thought_signature_for_later_append_turn(self):
         # Gemini's "thinking" models require echoing back each function call's
@@ -189,6 +198,18 @@ class GeminiProviderStreamTest(SimpleTestCase):
         self.assertEqual(''.join(result), 'Hello!')
         self.assertEqual(usage.input_tokens, 8)
         self.assertEqual(usage.output_tokens, 3)
+
+    def test_stream_warns_on_suspicious_finish_reason_with_no_tool_use(self):
+        # Regression test: a plain streamed reply with no tool call never
+        # reaches run_agent_loop (which does its own check) — this is the
+        # only place such a response's finish_reason is ever inspected.
+        chunks = [_make_response(text='Cut off', finish_reason='MAX_TOKENS')]
+        self.provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_FakeStream(chunks))
+
+        with self.assertLogs('ai_providers.base', level='WARNING'):
+            run(self._collect(self.provider.stream(
+                self.assistant, [{'role': 'user', 'content': 'Hi'}], 'sys', None, tool_executor=None,
+            )))
 
     def test_stream_runs_agent_loop_when_tool_calls_present(self):
         chunks = [

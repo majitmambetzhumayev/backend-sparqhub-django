@@ -1,4 +1,7 @@
+import logging
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -14,10 +17,34 @@ class ProviderResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     raw: object = None  # provider's native response, needed by append_turn
     usage: dict | None = None  # {"input_tokens": int, "output_tokens": int}
+    # Provider-native completion-status string (e.g. Anthropic's "end_turn"/
+    # "max_tokens", OpenAI/Mistral's "stop"/"length"/"content_filter",
+    # Google's "STOP"/"MAX_TOKENS"/"SAFETY") — deliberately left unnormalized
+    # across providers rather than mapped to a shared enum, since the only
+    # consumer today (run_agent_loop's truncation/content-filter check) just
+    # needs to tell "ordinary completion" apart from "something cut this
+    # off," not branch on the exact provider-specific reason.
+    finish_reason: str | None = None
 
     @property
     def requires_tool_execution(self) -> bool:
         return bool(self.tool_calls)
+
+
+# Values every provider uses for "the model stopped normally" (either with a
+# plain answer or by requesting a tool call) — anything else (a token-limit
+# cutoff, a content-filter block, etc.) is worth a trace, since nothing
+# previously checked this at all: a truncated/blocked response was consumed
+# exactly like a deliberate, complete one.
+_BENIGN_FINISH_REASONS = {None, "stop", "end_turn", "tool_use", "tool_calls", "STOP"}
+
+
+def warn_if_finish_reason_suspicious(response: "ProviderResponse") -> None:
+    if response.finish_reason not in _BENIGN_FINISH_REASONS:
+        logger.warning(
+            "Model response finished with reason %r (possible truncation or content filtering)",
+            response.finish_reason,
+        )
 
 
 @dataclass

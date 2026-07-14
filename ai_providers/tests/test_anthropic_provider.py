@@ -19,13 +19,14 @@ class AnthropicProviderCompleteTest(SimpleTestCase):
         self.assistant.model = 'claude-sonnet-4-6'
         self.assistant.instructions = 'Be helpful.'
 
-    def _make_text_response(self, text: str, input_tokens=10, output_tokens=5):
+    def _make_text_response(self, text: str, input_tokens=10, output_tokens=5, stop_reason='end_turn'):
         block = MagicMock()
         block.type = 'text'
         block.text = text
         response = MagicMock()
         response.content = [block]
         response.usage = MagicMock(input_tokens=input_tokens, output_tokens=output_tokens)
+        response.stop_reason = stop_reason
         return response
 
     def _make_tool_use_response(self, call_id, name, arguments, input_tokens=10, output_tokens=5):
@@ -37,6 +38,7 @@ class AnthropicProviderCompleteTest(SimpleTestCase):
         response = MagicMock()
         response.content = [block]
         response.usage = MagicMock(input_tokens=input_tokens, output_tokens=output_tokens)
+        response.stop_reason = 'tool_use'
         return response
 
     def test_complete_returns_text_response(self):
@@ -73,6 +75,13 @@ class AnthropicProviderCompleteTest(SimpleTestCase):
         )
         result = run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Hi'}], 'sys', None))
         self.assertEqual(result.usage, {'input_tokens': 42, 'output_tokens': 17})
+
+    def test_complete_captures_finish_reason(self):
+        self.provider.client.messages.create = AsyncMock(
+            return_value=self._make_text_response('Cut off...', stop_reason='max_tokens')
+        )
+        result = run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Hi'}], 'sys', None))
+        self.assertEqual(result.finish_reason, 'max_tokens')
 
     def test_append_turn_builds_tool_result_message(self):
         raw = self._make_tool_use_response('toolu_xyz', 'my_tool', {})

@@ -1,5 +1,7 @@
 import logging
 
+from ai_providers.base import warn_if_finish_reason_suspicious
+
 logger = logging.getLogger(__name__)
 
 # A model that keeps requesting tools without ever converging (e.g. asked to
@@ -48,4 +50,5 @@ async def run_agent_loop(
         response = await provider.complete(assistant, messages, system, tools)
         if usage is not None and response.usage:
             usage.add(**response.usage)
+    warn_if_finish_reason_suspicious(response)
     return response.text
