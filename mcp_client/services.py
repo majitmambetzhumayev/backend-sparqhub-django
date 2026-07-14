@@ -17,11 +17,15 @@ def _to_tool_schema(tool) -> dict:
 
 
 def _extract_result_text(result) -> str:
-    if not result.content:
-        return ""
-    return "\n".join(
-        item.text for item in result.content if hasattr(item, "text")
-    )
+    text = "\n".join(item.text for item in result.content if hasattr(item, "text")) if result.content else ""
+    # CallToolResult.isError signals the remote MCP server's tool itself
+    # failed — without this check, a failed call and a legitimately empty/
+    # short successful one were indistinguishable to the model (and an
+    # error with no content text collapsed into the exact same "" as a
+    # trivially-empty success).
+    if getattr(result, "isError", False):
+        return f"Error: {text}" if text else "Error: the tool call failed with no further detail."
+    return text
 
 
 @asynccontextmanager

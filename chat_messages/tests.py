@@ -16,7 +16,7 @@ from assistants.models import Assistant
 from chat_messages import generation_registry
 from chat_messages.consumers import ConversationConsumer
 from chat_messages.models import Message
-from chat_messages.services import send_message, _record_turn
+from chat_messages.services import send_message, _deduct_credits_after_persisted_turn, _record_turn
 from projects.models import Project
 from threads.models import Thread
 
@@ -147,6 +147,26 @@ class SendMessageServiceTest(TransactionTestCase):
     @patch("chat_messages.services.deduct_credits", new_callable=AsyncMock)
     @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.services.send_chat_message", new_callable=AsyncMock)
+    def test_returns_response_even_when_credit_deduction_fails(
+        self, mock_send, mock_extract_task, mock_deduct, mock_title_task,
+    ):
+        # Regression test: by the time deduct_credits runs, the assistant's
+        # reply is already saved and the caller has their answer — a
+        # billing failure here must not turn a successful turn into a bare
+        # 500, which would also invite a retry that pays for a second real
+        # provider call while this one goes uncharged either way.
+        mock_send.return_value = ("Hi there!", "usage-marker", True)
+        mock_deduct.side_effect = RuntimeError("db blip")
+
+        response_text = run(send_message(self.thread, "Hello", self.user))
+
+        self.assertEqual(response_text, "Hi there!")
+        self.assertEqual(Message.objects.filter(thread=self.thread, sender="assistant").count(), 1)
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.deduct_credits", new_callable=AsyncMock)
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.services.send_chat_message", new_callable=AsyncMock)
     def test_does_not_deduct_credits_when_personal_key_used(self, mock_send, mock_extract_task, mock_deduct, mock_title_task):
         mock_send.return_value = ("Hi there!", "usage-marker", False)
 
@@ -178,6 +198,32 @@ class SendMessageServiceTest(TransactionTestCase):
                 {"role": "assistant", "content": "Hi there!"},
             ],
         )
+
+
+class DeductCreditsAfterPersistedTurnTest(TransactionTestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="deductuser", password="pass")
+        self.assistant = Assistant.objects.create(
+            user=self.user, name="Chat Assistant", instructions="Be concise.",
+        )
+        self.thread = Thread.objects.create(user=self.user, assistant=self.assistant, conversation_state=[])
+
+    @patch("chat_messages.services.deduct_credits", new_callable=AsyncMock)
+    def test_swallows_and_logs_deduction_failure_instead_of_propagating(self, mock_deduct):
+        # Regression test: this call sits after the turn's reply is already
+        # saved — a billing failure here must never propagate and be
+        # mistaken for "the whole turn failed."
+        mock_deduct.side_effect = RuntimeError("db blip")
+
+        run(_deduct_credits_after_persisted_turn(self.user, self.thread, "usage-marker"))  # must not raise
+
+        mock_deduct.assert_awaited_once_with(self.user, self.thread.ai_provider, self.thread.model, "usage-marker")
+
+    @patch("chat_messages.services.deduct_credits", new_callable=AsyncMock)
+    def test_calls_through_on_success(self, mock_deduct):
+        run(_deduct_credits_after_persisted_turn(self.user, self.thread, "usage-marker"))
+
+        mock_deduct.assert_awaited_once_with(self.user, self.thread.ai_provider, self.thread.model, "usage-marker")
 
 
 class ConversationConsumerTest(TransactionTestCase):

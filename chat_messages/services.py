@@ -55,6 +55,20 @@ def _record_turn(thread, history, user_text, assistant_text, tool_calls=None):
     extract_memories_task.delay(thread.user_id, thread.assistant_id, user_text, assistant_text)
 
 
+async def _deduct_credits_after_persisted_turn(user, thread, usage) -> None:
+    """Isolates deduct_credits from the turn's own success/failure handling.
+    By the time this runs, the assistant's reply is already saved and the
+    user has their answer — a billing failure here must not masquerade as
+    (or trigger) a "something went wrong, please try again" chat.error,
+    which would be actively misleading and risks a retry that pays for a
+    second real provider call while this one goes uncharged either way.
+    Logged for ops/billing reconciliation instead of silently swallowed."""
+    try:
+        await deduct_credits(user, thread.ai_provider, thread.model, usage)
+    except Exception:
+        logger.exception("Credit deduction failed after a successful, already-saved turn for thread %s", thread.id)
+
+
 async def send_message(thread, text, user, memories=None) -> str:
     history = thread.conversation_state or []
     tool_calls: list[str] = []
@@ -69,7 +83,7 @@ async def send_message(thread, text, user, memories=None) -> str:
     )
     await sync_to_async(_record_turn)(thread, history, text, response_text, tool_calls)
     if used_global_key:
-        await deduct_credits(user, thread.ai_provider, thread.model, usage)
+        await _deduct_credits_after_persisted_turn(user, thread, usage)
     return response_text
 
 
@@ -153,7 +167,7 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         assistant_text = "".join(collected)
         await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls)
         if used_global_key:
-            await deduct_credits(user, thread.ai_provider, thread.model, usage)
+            await _deduct_credits_after_persisted_turn(user, thread, usage)
     except InsufficientCreditsError as exc:
         await channel_layer.group_send(group_name, {"type": "chat.error", "error": str(exc)})
         return
@@ -170,7 +184,7 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
             assistant_text = "".join(collected)
             await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls)
             if used_global_key:
-                await deduct_credits(user, thread.ai_provider, thread.model, usage)
+                await _deduct_credits_after_persisted_turn(user, thread, usage)
         await channel_layer.group_send(group_name, {"type": "chat.done", "thread_id": thread.id, "stopped": True})
         return
     except Exception:
