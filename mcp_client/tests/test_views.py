@@ -60,7 +60,7 @@ class MCPServerCRUDAPITest(APITestCase):
         }, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
-    @patch('mcp_client.serializers.socket.getaddrinfo', return_value=[(None, None, None, None, ('169.254.169.254', 0))])
+    @patch('mcp_client.services.socket.getaddrinfo', return_value=[(None, None, None, None, ('169.254.169.254', 0))])
     def test_sse_url_pointing_at_cloud_metadata_rejected(self, mock_getaddrinfo):
         # SSRF guard: SSE means *this server* connects to wherever the user
         # points it, unlike stdio (which just runs a command as the user).
@@ -70,14 +70,14 @@ class MCPServerCRUDAPITest(APITestCase):
         }, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    @patch('mcp_client.serializers.socket.getaddrinfo', return_value=[(None, None, None, None, ('127.0.0.1', 0))])
+    @patch('mcp_client.services.socket.getaddrinfo', return_value=[(None, None, None, None, ('127.0.0.1', 0))])
     def test_sse_url_pointing_at_loopback_rejected(self, mock_getaddrinfo):
         response = self.client.post(self.url, data={
             "project": self.project.id, "name": "Evil", "transport": "sse", "url": "http://localhost:8000/",
         }, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    @patch('mcp_client.serializers.socket.getaddrinfo', return_value=[(None, None, None, None, ('10.0.0.5', 0))])
+    @patch('mcp_client.services.socket.getaddrinfo', return_value=[(None, None, None, None, ('10.0.0.5', 0))])
     def test_sse_url_pointing_at_private_network_rejected(self, mock_getaddrinfo):
         response = self.client.post(self.url, data={
             "project": self.project.id, "name": "Evil", "transport": "sse", "url": "http://internal.example/",

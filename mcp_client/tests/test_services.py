@@ -1,7 +1,12 @@
-from unittest.mock import MagicMock
+import asyncio
+from unittest.mock import MagicMock, patch
 from django.test import SimpleTestCase
 
-from mcp_client.services import _extract_result_text, _to_tool_schema
+from mcp_client.services import _extract_result_text, _open_session, _to_tool_schema, is_safe_sse_url
+
+
+def run(coro):
+    return asyncio.run(coro)
 
 
 class ToToolSchemaTest(SimpleTestCase):
@@ -78,3 +83,38 @@ class ExtractResultTextTest(SimpleTestCase):
         result.content = []
         result.isError = True
         self.assertEqual(_extract_result_text(result), "Error: the tool call failed with no further detail.")
+
+
+class IsSafeSseUrlTest(SimpleTestCase):
+    @patch('mcp_client.services.socket.getaddrinfo', return_value=[(None, None, None, None, ('93.184.216.34', 0))])
+    def test_public_ip_is_safe(self, mock_getaddrinfo):
+        self.assertTrue(is_safe_sse_url('https://example.com/mcp'))
+
+    @patch('mcp_client.services.socket.getaddrinfo', return_value=[(None, None, None, None, ('169.254.169.254', 0))])
+    def test_cloud_metadata_ip_is_unsafe(self, mock_getaddrinfo):
+        self.assertFalse(is_safe_sse_url('http://example.com/mcp'))
+
+    def test_non_http_scheme_is_unsafe(self):
+        self.assertFalse(is_safe_sse_url('file:///etc/passwd'))
+
+
+class OpenSessionSseRebindingTest(SimpleTestCase):
+    @patch('mcp_client.services.sse_client')
+    @patch('mcp_client.services.is_safe_sse_url', return_value=False)
+    def test_refuses_to_connect_when_url_no_longer_safe(self, mock_is_safe, mock_sse_client):
+        # Regression test for a DNS-rebinding SSRF: is_safe_sse_url used to
+        # be checked ONLY at server-registration time — a hostname that
+        # resolved to a public IP when saved could later be repointed at an
+        # internal address (near-zero-TTL DNS), and every chat turn
+        # re-resolves the hostname fresh via a brand-new connection with no
+        # re-check. This proves the connection itself is now gated on a
+        # fresh check, not just the one at save time.
+        server = MagicMock(transport='sse', url='https://rebound.example.com/mcp')
+
+        async def scenario():
+            async with _open_session(server):
+                pass  # pragma: no cover - must never get here, is_safe_sse_url blocks first
+
+        with self.assertRaises(ValueError):
+            run(scenario())
+        mock_sse_client.assert_not_called()
