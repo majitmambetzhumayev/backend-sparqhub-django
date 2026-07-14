@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 from authlib.integrations.base_client import OAuthError
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
+from django.core.cache import cache
 from django.contrib.auth.tokens import default_token_generator
 from django.http import HttpResponseRedirect
 
@@ -77,6 +78,7 @@ class LoginCsrfProtectionTest(APITestCase):
     # already fetches /api/csrf/ on app mount before any login attempt, so
     # requiring the token here doesn't break the real login flow.
     def setUp(self):
+        cache.clear()  # avoid the 'auth' throttle scope leaking across tests
         User.objects.create_user(username='csrfuser', password='pass', email_verified=True)
 
     def test_login_without_csrf_token_is_rejected(self):
@@ -95,6 +97,30 @@ class LoginCsrfProtectionTest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
+class AuthEndpointRateLimitTest(APITestCase):
+    # Guards against credential stuffing / brute force on pre-auth
+    # endpoints, where there's no user identity to key on yet — only IP.
+    def setUp(self):
+        cache.clear()
+        User.objects.create_user(username='ratelimituser', password='pass', email_verified=True)
+
+    def test_login_endpoint_is_rate_limited(self):
+        url = reverse('auth-login')
+        for _ in range(10):
+            self.client.post(url, {"username": "ratelimituser", "password": "wrong"})
+        response = self.client.post(url, {"username": "ratelimituser", "password": "wrong"})
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_register_endpoint_is_rate_limited(self):
+        url = reverse('auth-register')
+        for i in range(10):
+            self.client.post(url, {"username": f"newuser{i}", "password": "pass12345", "email": f"n{i}@example.com"})
+        response = self.client.post(
+            url, {"username": "onemore", "password": "pass12345", "email": "onemore@example.com"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
 class AuthCookieDomainTest(APITestCase):
     # Regression tests: a cookie set with no `domain` is host-only (scoped
     # exactly to the host that set it) and is never sent to a sibling
@@ -103,6 +129,7 @@ class AuthCookieDomainTest(APITestCase):
     # frontend's own server-side auth check (reading this cookie on its own
     # domain) never sees it and the user gets bounced back to login forever.
     def setUp(self):
+        cache.clear()  # avoid the shared 'auth' throttle scope leaking across tests
         User.objects.create_user(username="cookieuser", password="pass", email_verified=True)
 
     def test_cookies_are_host_only_by_default(self):
@@ -128,6 +155,9 @@ class AuthCookieDomainTest(APITestCase):
 
 
 class RegistrationEmailTest(APITestCase):
+    def setUp(self):
+        cache.clear()  # avoid the shared 'auth' throttle scope leaking across tests
+
     def test_registration_requires_email(self):
         response = self.client.post(reverse('auth-register'), {"username": "newuser", "password": "pass12345"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -186,6 +216,7 @@ class RegistrationEmailTest(APITestCase):
 
 class PasswordResetTest(APITestCase):
     def setUp(self):
+        cache.clear()  # avoid the shared 'auth' throttle scope leaking across tests
         self.user = User.objects.create_user(username="resetuser", password="oldpass123", email="reset@example.com")
 
     @patch('users.services.send_email_task')
@@ -254,6 +285,7 @@ class PasswordResetTest(APITestCase):
 
 class EmailVerificationLoginGateTest(APITestCase):
     def setUp(self):
+        cache.clear()  # avoid the shared 'auth' throttle scope leaking across tests
         self.verified_user = User.objects.create_user(
             username="verified", password="pass12345", email="verified@example.com", email_verified=True,
         )
@@ -274,6 +306,7 @@ class EmailVerificationLoginGateTest(APITestCase):
 
 class EmailConfirmTest(APITestCase):
     def setUp(self):
+        cache.clear()  # avoid the shared 'auth' throttle scope leaking across tests
         self.user = User.objects.create_user(username="confirmuser", password="pass12345", email="confirm@example.com")
 
     def _valid_uid_token(self):

@@ -22,6 +22,7 @@ class SendMessageAPIView(APIView):
     POST /api/threads/<thread_id>/messages/ → append message to existing thread
     GET  /api/threads/<thread_id>/messages/ → list messages for a thread
     """
+    throttle_scope = 'chat'
 
     def get(self, request, thread_id=None, format=None):
         if thread_id is None:

@@ -43,6 +43,7 @@ def _set_auth_cookies(response, access, refresh=None):
 @method_decorator(csrf_protect, name='dispatch')
 class CookieTokenObtainPairView(TokenObtainPairView):
     serializer_class = EmailVerifiedTokenObtainPairSerializer
+    throttle_scope = 'auth'
 
     def post(self, request, *args, **kwargs):
         response = super().post(request, *args, **kwargs)
@@ -64,6 +65,7 @@ class RegisterAPIView(generics.CreateAPIView):
     serializer_class = UserRegisterSerializer
     permission_classes = [AllowAny]
     authentication_classes = []
+    throttle_scope = 'auth'
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -100,6 +102,7 @@ class LogoutAPIView(APIView):
 class PasswordResetRequestAPIView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
+    throttle_scope = 'auth'
 
     def post(self, request):
         email = request.data.get('email', '')
@@ -114,6 +117,7 @@ class PasswordResetRequestAPIView(APIView):
 class PasswordResetConfirmAPIView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
+    throttle_scope = 'auth'
 
     def post(self, request):
         uid = request.data.get('uid', '')
@@ -132,6 +136,7 @@ class PasswordResetConfirmAPIView(APIView):
 class EmailConfirmAPIView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
+    throttle_scope = 'auth'
 
     def post(self, request):
         uid = request.data.get('uid', '')

@@ -5,8 +5,10 @@ import logging
 
 from asgiref.sync import sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
+from django.conf import settings
 
 from chat_messages import generation_registry
+from core.rate_limit import check_rate_limit
 from chat_messages.services import run_and_broadcast_turn
 from librarian.services import retrieve_relevant_memories
 from projects.models import Project
@@ -116,6 +118,21 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         # in the process (asyncio only switches tasks at an await/yield
         # point). Moving this into an awaited helper would silently reopen
         # the double-generation race it exists to close.
+        #
+        # Rate-limited before any of that — Django's cache framework is
+        # synchronous but not I/O-bound (in-process for LocMemCache under
+        # this app's current single-process deployment), so it's safe to
+        # call directly here without breaking the synchronous-claim
+        # invariant above. Same per-minute budget as SendMessageAPIView's
+        # HTTP equivalent (settings.CHAT_MESSAGES_PER_MINUTE) — this is the
+        # WS side of the same underlying "send a chat message" action, and
+        # nothing else bounds tool-heavy or just-enthusiastic message bursts
+        # from hammering the shared global-provider-key rate limit.
+        user = self.scope["user"]
+        if not check_rate_limit(f"ratelimit:chat:{user.id}", settings.CHAT_MESSAGES_PER_MINUTE, 60):
+            await self._safe_send({"error": "You're sending messages too fast. Please slow down."})
+            return
+
         thread_id = data.get("thread_id")
         if thread_id is not None:
             if not generation_registry.try_claim(thread_id):

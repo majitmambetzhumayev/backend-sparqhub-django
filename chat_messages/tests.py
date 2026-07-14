@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock, patch
 
 from channels.consumer import AsyncConsumer
 from channels.testing import WebsocketCommunicator
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.test import TransactionTestCase
 from django.urls import reverse
 from rest_framework.test import APITestCase
@@ -570,6 +572,31 @@ class ConversationConsumerTest(TransactionTestCase):
         # actually released.
         self.assertEqual(second_frame, {"status": "thinking"})
 
+    @patch("chat_messages.consumers.check_rate_limit", return_value=False)
+    def test_rejects_message_when_rate_limited(self, mock_check_rate_limit):
+        # Proves the WS path (the primary way messages are sent — the HTTP
+        # equivalent is covered separately in SendMessageAPIRateLimitTest)
+        # is actually gated on the same budget, and rejects *before* ever
+        # claiming a generation_registry slot — nothing to leak/release
+        # since the check runs ahead of try_claim.
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            frame = await communicator.receive_json_from()
+            await communicator.disconnect()
+            return frame
+
+        frame = run(scenario())
+        self.assertIn("error", frame)
+        self.assertFalse(generation_registry.is_active(self.existing_thread.id))
+        mock_check_rate_limit.assert_called_once_with(
+            f"ratelimit:chat:{self.user.id}", settings.CHAT_MESSAGES_PER_MINUTE, 60,
+        )
+
     def test_rejects_unowned_project_id_on_new_thread_creation(self):
         # Regression test: get_or_create_thread used to silently drop an
         # unresolvable/unauthorized project_id and create a project-less
@@ -1048,3 +1075,20 @@ class SendMessageAPICreditsTest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         self.assertEqual(response.data["error"], "Project not found.")
         self.assertEqual(Thread.objects.filter(user=self.user).count(), 0)
+
+
+class SendMessageAPIRateLimitTest(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username="chatratelimituser", password="pass")
+        self.client.force_authenticate(user=self.user)
+
+    @patch("chat_messages.views.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.views.send_message", new_callable=AsyncMock)
+    def test_send_message_endpoint_is_rate_limited(self, mock_send, mock_memories):
+        mock_send.return_value = "ok"
+        url = reverse('message-list-create-thread')
+        for _ in range(settings.CHAT_MESSAGES_PER_MINUTE):
+            self.client.post(url, {"message": "hi"}, format='json')
+        response = self.client.post(url, {"message": "hi"}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)

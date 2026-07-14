@@ -247,6 +247,12 @@ SIMPLE_JWT = {
     'BLACKLIST_AFTER_ROTATION': True,
 }
 
+# Shared with the WebSocket chat path's own rate check (core/rate_limit.py,
+# used from chat_messages/consumers.py) — a single source of truth so the
+# HTTP (SendMessageAPIView) and WS budgets for "sending a chat message"
+# don't silently drift apart.
+CHAT_MESSAGES_PER_MINUTE = 30
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'users.authentication.CookieJWTAuthentication',
@@ -256,6 +262,21 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ),
     'EXCEPTION_HANDLER': 'core.exceptions.api_exception_handler',
+    # ScopedRateThrottle only throttles a view that opts in via its own
+    # throttle_scope attribute — safe to set globally, it's a no-op on every
+    # view that doesn't set one. Keys by request.user.pk when authenticated,
+    # falling back to IP only for pre-auth endpoints (login/register/
+    # password-reset) — the only cases where no user identity exists yet to
+    # key on instead, so a shared IP (NAT, VPN, mobile carrier) can't be
+    # mistaken for a single abusive user on every other throttled endpoint.
+    'DEFAULT_THROTTLE_CLASSES': (
+        'rest_framework.throttling.ScopedRateThrottle',
+    ),
+    'DEFAULT_THROTTLE_RATES': {
+        'auth': '10/min',
+        'chat': f'{CHAT_MESSAGES_PER_MINUTE}/min',
+        'uploads': '20/hour',
+    },
 }
 
 LOGGING = {
