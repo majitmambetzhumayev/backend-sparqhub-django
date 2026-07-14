@@ -1,10 +1,12 @@
 from unittest.mock import MagicMock, patch
 
+from django.core.cache import cache
 from django.test import SimpleTestCase, TestCase
 from rest_framework.exceptions import NotFound
 
 from core.embeddings import embed, embed_batch, get_embed_client
 from core.exceptions import api_exception_handler
+from core.rate_limit import check_rate_limit
 from core.services import send_email
 
 
@@ -89,3 +91,35 @@ class ApiExceptionHandlerTest(SimpleTestCase):
     def test_logs_the_unhandled_exception(self):
         with self.assertLogs('core.exceptions', level='ERROR'):
             api_exception_handler(RuntimeError('boom'), {'view': MagicMock()})
+
+
+class CheckRateLimitTest(SimpleTestCase):
+    def setUp(self):
+        cache.clear()
+
+    def test_allows_requests_within_the_limit(self):
+        key = 'ratelimit:test:within'
+        for _ in range(5):
+            self.assertTrue(check_rate_limit(key, limit=5, window_seconds=60))
+
+    def test_rejects_the_request_that_exceeds_the_limit(self):
+        key = 'ratelimit:test:exceeds'
+        for _ in range(5):
+            check_rate_limit(key, limit=5, window_seconds=60)
+        self.assertFalse(check_rate_limit(key, limit=5, window_seconds=60))
+
+    def test_different_keys_have_independent_budgets(self):
+        # Regression-shaped test: two different users (different keys) must
+        # not share a budget — one user's usage must never count against
+        # another's, which is the whole point of keying by user identity.
+        for _ in range(5):
+            check_rate_limit('ratelimit:test:userA', limit=5, window_seconds=60)
+        self.assertTrue(check_rate_limit('ratelimit:test:userB', limit=5, window_seconds=60))
+
+    def test_resets_after_the_window_expires(self):
+        key = 'ratelimit:test:resets'
+        for _ in range(3):
+            check_rate_limit(key, limit=3, window_seconds=60)
+        self.assertFalse(check_rate_limit(key, limit=3, window_seconds=60))
+        cache.delete(key)  # simulates the window's timeout elapsing
+        self.assertTrue(check_rate_limit(key, limit=3, window_seconds=60))

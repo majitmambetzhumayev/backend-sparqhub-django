@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.urls import reverse
@@ -114,3 +115,31 @@ class ProjectFileCRUDAPITest(APITestCase):
         detail_url = reverse('projectfile-detail', kwargs={'pk': file_obj.id})
         response = self.client.patch(detail_url, data={'original_filename': 'renamed.txt'}, format='json')
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+class ProjectFileUploadRateLimitTest(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='uploadratelimituser', password='pass')
+        self.client.force_authenticate(user=self.user)
+        self.project = Project.objects.create(user=self.user, name='Research')
+        self.url = reverse('projectfile-list')
+
+    @patch('project_files.tasks.process_project_file_task.delay')
+    @patch('project_files.services.default_storage')
+    def test_create_action_is_rate_limited_but_list_is_not(self, mock_storage, mock_delay):
+        mock_storage.save.return_value = 'project_files/x.txt'
+        mock_storage.url.return_value = 'https://pub-x.r2.dev/project_files/x.txt'
+
+        for i in range(20):
+            uploaded = SimpleUploadedFile(f'notes{i}.txt', b'hello world', content_type='text/plain')
+            self.client.post(self.url, data={'project': self.project.id, 'file': uploaded}, format='multipart')
+
+        uploaded = SimpleUploadedFile('one-more.txt', b'hello world', content_type='text/plain')
+        response = self.client.post(self.url, data={'project': self.project.id, 'file': uploaded}, format='multipart')
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # list/retrieve/delete are deliberately not scoped — only the
+        # expensive create action is budget-limited.
+        list_response = self.client.get(self.url)
+        self.assertEqual(list_response.status_code, status.HTTP_200_OK)
