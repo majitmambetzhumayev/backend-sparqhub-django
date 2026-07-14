@@ -214,54 +214,77 @@ class ConversationConsumer(AsyncWebsocketConsumer):
             return
 
         user = self.scope["user"]
+        # Tracks which generation_registry key (if any) is currently claimed
+        # by this call, so the outer except below always releases the right
+        # one — an existing thread is already claimed under thread_id before
+        # this method even runs; a brand-new thread isn't claimed until
+        # try_claim(thread.id) succeeds a few lines down.
+        claimed_thread_id = thread_id
         try:
-            thread = await sync_to_async(get_or_create_thread)(
-                user, thread_id=thread_id, ai_provider=ai_provider, model=model, project_id=project_id,
-            )
-        except Thread.DoesNotExist:
-            if thread_id is not None:
-                generation_registry.release(thread_id)
-            self._creating_thread = False
-            await self._safe_send({"error": "Thread not found."})
-            return
+            try:
+                thread = await sync_to_async(get_or_create_thread)(
+                    user, thread_id=thread_id, ai_provider=ai_provider, model=model, project_id=project_id,
+                )
+            except Thread.DoesNotExist:
+                if thread_id is not None:
+                    generation_registry.release(thread_id)
+                await self._safe_send({"error": "Thread not found."})
+                return
 
-        if thread_id is None:
-            # Brand-new thread: claim now using the just-assigned id. No
-            # race to worry about — nothing else can reference this id
-            # before this line runs.
-            generation_registry.try_claim(thread.id)
+            if thread_id is None:
+                # Brand-new thread: claim now using the just-assigned id. No
+                # race to worry about — nothing else can reference this id
+                # before this line runs.
+                generation_registry.try_claim(thread.id)
+                claimed_thread_id = thread.id
 
-        # Register this method's own task (asyncio.create_task(self._start_generation(...))
-        # in receive()) rather than spawning a further nested task for
-        # run_and_broadcast_turn — one task, awaited directly below, is
-        # simpler and just as uncancellable-by-disconnect as two would be
-        # (nothing cancels either), and it's what a future
-        # cancel/"stop generation" feature would target.
-        generation_registry.attach_task(thread.id, asyncio.current_task())
+            # Register this method's own task (asyncio.create_task(self._start_generation(...))
+            # in receive()) rather than spawning a further nested task for
+            # run_and_broadcast_turn — one task, awaited directly below, is
+            # simpler and just as uncancellable-by-disconnect as two would be
+            # (nothing cancels either), and it's what a future
+            # cancel/"stop generation" feature would target.
+            generation_registry.attach_task(thread.id, asyncio.current_task())
 
-        group_name = f"thread_{thread.id}"
-        await self.channel_layer.group_add(group_name, self.channel_name)
-        self._joined_groups.add(group_name)
+            group_name = f"thread_{thread.id}"
+            await self.channel_layer.group_add(group_name, self.channel_name)
+            self._joined_groups.add(group_name)
 
-        try:
-            memories = await sync_to_async(retrieve_relevant_memories)(user, message_text)
-        except Exception:
-            # Memory recall is a supplementary enrichment, not the core
-            # feature — degrade gracefully (e.g. a corrupted/mismatched
-            # embedding row for this user) rather than losing the whole turn
-            # to an unhandled task exception, which previously left the
-            # thread claimed forever in generation_registry with no
-            # chat.error ever reaching the client (silent, permanent hang).
-            logger.exception("Failed to retrieve memories for user %s; continuing without them", user.id)
-            memories = []
-        await self.channel_layer.group_send(group_name, {"type": "chat.status", "status": "thinking"})
+            try:
+                memories = await sync_to_async(retrieve_relevant_memories)(user, message_text)
+            except Exception:
+                # Memory recall is a supplementary enrichment, not the core
+                # feature — degrade gracefully (e.g. a corrupted/mismatched
+                # embedding row for this user) rather than losing the whole
+                # turn to an unhandled task exception, which previously left
+                # the thread claimed forever in generation_registry with no
+                # chat.error ever reaching the client (silent, permanent hang).
+                logger.exception("Failed to retrieve memories for user %s; continuing without them", user.id)
+                memories = []
+            await self.channel_layer.group_send(group_name, {"type": "chat.status", "status": "thinking"})
 
-        try:
             await run_and_broadcast_turn(thread, message_text, user, group_name, memories=memories)
+        except Exception:
+            # Anything else unexpected between claiming the thread and
+            # handing off to run_and_broadcast_turn (whose own try/finally
+            # already covers itself once it starts) must not die silently
+            # inside this un-awaited task (asyncio.create_task in receive(),
+            # never awaited by anything) — that previously left
+            # generation_registry's claim leaked forever with no chat.error
+            # ever reaching the client (the same failure mode as the
+            # retrieve_relevant_memories incident above, just one step
+            # earlier in this method — e.g. get_or_create_thread raising
+            # something other than Thread.DoesNotExist, or a transient
+            # Redis blip on group_add, both previously uncaught here).
+            logger.exception("Unexpected failure in _start_generation for thread %s", claimed_thread_id)
+            if claimed_thread_id is not None:
+                generation_registry.release(claimed_thread_id)
+            await self._safe_send({"error": "Something went wrong while starting the response. Please try again."})
         finally:
-            # generation_registry.release() already happened inside
-            # run_and_broadcast_turn's own finally — this only resets the
-            # connection-local new-thread guard, a separate concern.
+            # generation_registry.release() already happened above (or
+            # inside run_and_broadcast_turn's own finally on the success
+            # path) — this only resets the connection-local new-thread
+            # guard, a separate concern.
             if thread_id is None:
                 self._creating_thread = False
 
