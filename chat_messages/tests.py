@@ -919,6 +919,62 @@ class ConversationConsumerTest(TransactionTestCase):
         # thread would be rejected forever.
         self.assertFalse(generation_registry.is_active(self.existing_thread.id))
 
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
+    def test_tool_confirmation_rejects_a_thread_belonging_to_another_user(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # Regression test: generation_registry is keyed only by a plain
+        # integer thread_id with no ownership check of its own — a
+        # tool_confirmation message used to resolve ANY pending confirmation
+        # by thread_id, letting any authenticated user approve/deny another
+        # user's pending delegate_to_model escalation just by guessing the id.
+        async def fake_send_chat_message(*args, **kwargs):
+            confirmed = await kwargs["confirm_tool_call"]("delegate_to_model", {"provider": "gemini"})
+
+            async def fake_chunks():
+                yield "Confirmed!" if confirmed else "Declined."
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+        attacker = User.objects.create_user(username="toolconfirmattacker", password="pass")
+
+        async def scenario():
+            owner_conn = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            owner_conn.scope["user"] = self.user
+            connected, _ = await owner_conn.connect()
+            assert connected
+
+            await owner_conn.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            await owner_conn.receive_json_from()  # thinking
+            confirm_frame = await owner_conn.receive_json_from()  # confirm_required
+
+            attacker_conn = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            attacker_conn.scope["user"] = attacker
+            connected, _ = await attacker_conn.connect()
+            assert connected
+            await attacker_conn.send_json_to(
+                {"type": "tool_confirmation", "thread_id": confirm_frame["thread_id"], "confirmed": True},
+            )
+            attacker_frame = await attacker_conn.receive_json_from()
+            await attacker_conn.disconnect()
+
+            # The real owner's confirmation must still be pending — the
+            # attacker's attempt must not have resolved it.
+            await owner_conn.send_json_to(
+                {"type": "tool_confirmation", "thread_id": confirm_frame["thread_id"], "confirmed": True},
+            )
+            chunk_frame = await owner_conn.receive_json_from()
+            await owner_conn.disconnect()
+            return attacker_frame, chunk_frame
+
+        attacker_frame, chunk_frame = run(scenario())
+        self.assertIn("error", attacker_frame)
+        self.assertEqual(chunk_frame, {"chunk": "Confirmed!"})
+
     def test_stop_generation_rejects_a_thread_belonging_to_another_user(self):
         other_user = User.objects.create_user(username="otheruser2", password="pass")
 

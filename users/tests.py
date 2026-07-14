@@ -12,7 +12,7 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 from rest_framework import status
 from rest_framework_simplejwt.tokens import AccessToken
 
@@ -66,6 +66,33 @@ class JWTAuthMiddlewareTest(TransactionTestCase):
             with self.assertLogs("users.ws_auth", level="ERROR"):
                 user = self._resolved_user(f"access_token={token}")
         self.assertIsInstance(user, AnonymousUser)
+
+
+class LoginCsrfProtectionTest(APITestCase):
+    # Regression test: CookieTokenObtainPairView used to be @csrf_exempt in
+    # addition to @ensure_csrf_cookie — combined with DRF's default parsers
+    # accepting a plain form-encoded body, that made "login CSRF" possible
+    # (a cross-site auto-submitting HTML form could force a victim's browser
+    # to authenticate as an attacker-controlled account). The frontend
+    # already fetches /api/csrf/ on app mount before any login attempt, so
+    # requiring the token here doesn't break the real login flow.
+    def setUp(self):
+        User.objects.create_user(username='csrfuser', password='pass', email_verified=True)
+
+    def test_login_without_csrf_token_is_rejected(self):
+        client = APIClient(enforce_csrf_checks=True)
+        response = client.post(reverse('auth-login'), {"username": "csrfuser", "password": "pass"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_login_with_valid_csrf_token_succeeds(self):
+        client = APIClient(enforce_csrf_checks=True)
+        client.get(reverse('csrf'))
+        token = client.cookies['csrftoken'].value
+
+        response = client.post(
+            reverse('auth-login'), {"username": "csrfuser", "password": "pass"}, HTTP_X_CSRFTOKEN=token,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
 class AuthCookieDomainTest(APITestCase):
