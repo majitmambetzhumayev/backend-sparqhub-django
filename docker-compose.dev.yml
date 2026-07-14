@@ -44,8 +44,25 @@ services:
     ports:
       - "6379:6379"
 
+  # Mirrors docker-compose.yml's migrate service — without it, a migration
+  # generated in code (committed, present in migrations/) can silently never
+  # get applied to this dev DB, since nothing here forced it to run. That
+  # gap let a model/DB schema mismatch persist undetected (see
+  # librarian.0002_alter_memoryentry_embedding).
+  migrate:
+    <<: *app
+    command: python manage.py migrate --noinput
+    restart: "no"
+
   web:
     <<: *app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "8000:8000"
 

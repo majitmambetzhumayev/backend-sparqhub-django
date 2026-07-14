@@ -1,8 +1,10 @@
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase, TestCase
+from rest_framework.exceptions import NotFound
 
 from core.embeddings import embed, embed_batch, get_embed_client
+from core.exceptions import api_exception_handler
 from core.services import send_email
 
 
@@ -67,3 +69,23 @@ class PermissionsPolicyMiddlewareTest(TestCase):
         response = self.client.get('/api/healthcheck/')
         self.assertIn('camera=()', response['Permissions-Policy'])
         self.assertIn('microphone=()', response['Permissions-Policy'])
+
+
+class ApiExceptionHandlerTest(SimpleTestCase):
+    def test_delegates_to_drf_default_handler_for_api_exceptions(self):
+        response = api_exception_handler(NotFound('missing'), {'view': MagicMock()})
+        self.assertEqual(response.status_code, 404)
+
+    def test_returns_structured_500_for_unhandled_exception(self):
+        # Regression test: DRF's default handler only formats
+        # APIException/Http404/PermissionDenied — anything else (a bug in a
+        # view/service reached without its own try/except) previously fell
+        # through to Django's generic 500 handling, violating this repo's
+        # own "always return {'error': ...}" convention.
+        response = api_exception_handler(RuntimeError('boom'), {'view': MagicMock()})
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.data, {'error': 'An unexpected error occurred.'})
+
+    def test_logs_the_unhandled_exception(self):
+        with self.assertLogs('core.exceptions', level='ERROR'):
+            api_exception_handler(RuntimeError('boom'), {'view': MagicMock()})
