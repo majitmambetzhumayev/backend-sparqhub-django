@@ -394,9 +394,18 @@ class GetOrCreateOAuthUserTest(TestCase):
         self.assertEqual(user.email, 'newuser@example.com')
         self.assertEqual(user.username, 'newuser')
 
-    def test_links_existing_unverified_user_by_email(self):
-        existing = User.objects.create_user(username='existing', password='pass', email='link@example.com')
+    def test_reclaims_existing_unverified_user_by_email_and_invalidates_its_password(self):
+        # Regression test for a pre-account-hijacking vulnerability: anyone
+        # can register with any email address and leave it unconfirmed
+        # (e.g. squatting the real owner's email with an attacker-chosen
+        # password, hoping the owner later signs in via OAuth and inherits
+        # that password-protected row). OAuth login must reclaim the
+        # account AND invalidate whatever password was already set, so the
+        # squatter's password stops working the moment the real owner
+        # proves ownership via the provider.
+        existing = User.objects.create_user(username='existing', password='attacker-chosen-pw', email='link@example.com')
         self.assertFalse(existing.email_verified)
+        self.assertTrue(existing.check_password('attacker-chosen-pw'))
 
         user = get_or_create_oauth_user('github', 'gh-1', 'link@example.com')
 
@@ -404,6 +413,20 @@ class GetOrCreateOAuthUserTest(TestCase):
         user.refresh_from_db()
         self.assertEqual(user.github_id, 'gh-1')
         self.assertTrue(user.email_verified)
+        self.assertFalse(user.has_usable_password())
+        self.assertFalse(user.check_password('attacker-chosen-pw'))
+
+    def test_linking_a_second_provider_to_an_already_verified_user_does_not_touch_password(self):
+        existing = User.objects.create_user(
+            username='alreadyverified', password='real-user-pw', email='verified@example.com', email_verified=True,
+        )
+
+        user = get_or_create_oauth_user('github', 'gh-2', 'verified@example.com')
+
+        self.assertEqual(user.pk, existing.pk)
+        user.refresh_from_db()
+        self.assertEqual(user.github_id, 'gh-2')
+        self.assertTrue(user.check_password('real-user-pw'))
 
     def test_returns_same_user_on_repeat_call(self):
         first = get_or_create_oauth_user('google', 'g-2', 'repeat@example.com')

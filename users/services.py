@@ -104,7 +104,22 @@ def get_or_create_oauth_user(provider: str, provider_user_id: str, email: str):
     field name. Both providers verify email ownership themselves, so a match
     (by provider id, then by email) or a fresh account is always marked
     email_verified — this is the one path that bypasses the confirmation
-    email entirely."""
+    email entirely.
+
+    An existing account found by email that was NOT already verified is
+    reclaimed, not just trusted as-is: anyone can register with any email
+    address before ever proving they own it (registration sends a
+    confirmation link, but nothing stops someone from registering with
+    someone else's email and leaving it unconfirmed — a pre-account-
+    hijacking setup). OAuth login is itself proof of ownership, stronger
+    than clicking a confirmation link since the provider authenticated the
+    person directly — so on first OAuth login for a matching-but-unverified
+    account, take it over and invalidate whatever password may already be
+    set on it, rather than trusting a password nobody vouched for. (A fresh
+    separate account isn't an option either way — email has a DB-level
+    uniqueness constraint.) Once verified, later logins here (a second OAuth
+    provider linking to the same, already-legitimate account) don't touch
+    the password again."""
     id_field = f"{provider}_id"
 
     user = User.objects.filter(**{id_field: provider_user_id}).first()
@@ -114,8 +129,12 @@ def get_or_create_oauth_user(provider: str, provider_user_id: str, email: str):
     user = User.objects.filter(email=email).first()
     if user is not None:
         setattr(user, id_field, provider_user_id)
-        user.email_verified = True
-        user.save(update_fields=[id_field, "email_verified"])
+        update_fields = [id_field]
+        if not user.email_verified:
+            user.email_verified = True
+            user.set_unusable_password()
+            update_fields += ["email_verified", "password"]
+        user.save(update_fields=update_fields)
         return user
 
     username = _generate_unique_username(email)
