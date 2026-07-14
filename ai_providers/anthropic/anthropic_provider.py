@@ -2,7 +2,9 @@ import anthropic
 from django.conf import settings
 
 from ai_providers.agent_loop import run_agent_loop
-from ai_providers.base import AIProviderBase, ProviderResponse, ToolCall, UsageAccumulator
+from ai_providers.base import (
+    AIProviderBase, ProviderResponse, ToolCall, UsageAccumulator, warn_if_finish_reason_suspicious,
+)
 
 
 class AnthropicProvider(AIProviderBase):
@@ -46,7 +48,7 @@ class AnthropicProvider(AIProviderBase):
             elif hasattr(block, "text"):
                 text = block.text
         usage = {"input_tokens": raw.usage.input_tokens, "output_tokens": raw.usage.output_tokens}
-        return ProviderResponse(text=text, tool_calls=tool_calls, raw=raw, usage=usage)
+        return ProviderResponse(text=text, tool_calls=tool_calls, raw=raw, usage=usage, finish_reason=raw.stop_reason)
 
     async def complete(self, assistant, messages, system, tools) -> ProviderResponse:
         kwargs = self._build_kwargs(assistant, messages, system, tools)
@@ -83,3 +85,8 @@ class AnthropicProvider(AIProviderBase):
                 initial_response=response, usage=usage, on_tool_call=on_tool_call,
             )
             yield text
+        else:
+            # No tool call this turn, so run_agent_loop (which does its own
+            # check on the final response) never runs — this is the only
+            # place a plain streamed reply's finish_reason is ever seen.
+            warn_if_finish_reason_suspicious(response)

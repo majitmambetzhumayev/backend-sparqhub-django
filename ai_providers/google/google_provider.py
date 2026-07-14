@@ -3,7 +3,9 @@ from google.genai import types
 from django.conf import settings
 
 from ai_providers.agent_loop import run_agent_loop
-from ai_providers.base import AIProviderBase, ProviderResponse, ToolCall, UsageAccumulator
+from ai_providers.base import (
+    AIProviderBase, ProviderResponse, ToolCall, UsageAccumulator, warn_if_finish_reason_suspicious,
+)
 
 
 class GeminiProvider(AIProviderBase):
@@ -105,7 +107,10 @@ class GeminiProvider(AIProviderBase):
             "input_tokens": raw.usage_metadata.prompt_token_count or 0,
             "output_tokens": raw.usage_metadata.candidates_token_count or 0,
         }
-        return ProviderResponse(text=raw.text or "", tool_calls=tool_calls, raw=raw, usage=usage)
+        finish_reason = None
+        if raw.candidates and raw.candidates[0].finish_reason is not None:
+            finish_reason = raw.candidates[0].finish_reason.value
+        return ProviderResponse(text=raw.text or "", tool_calls=tool_calls, raw=raw, usage=usage, finish_reason=finish_reason)
 
     async def complete(self, assistant, messages, system, tools) -> ProviderResponse:
         kwargs = self._build_kwargs(assistant, messages, system, tools)
@@ -144,6 +149,7 @@ class GeminiProvider(AIProviderBase):
         text_parts = []
         tool_calls: list[ToolCall] = []
         raw_usage = None
+        finish_reason = None
 
         stream = await self.client.aio.models.generate_content_stream(**kwargs)
         async for chunk in stream:
@@ -152,6 +158,8 @@ class GeminiProvider(AIProviderBase):
                 yield chunk.text
             if chunk.candidates and chunk.candidates[0].content:
                 tool_calls.extend(self._extract_tool_calls_from_parts(chunk.candidates[0].content.parts))
+            if chunk.candidates and chunk.candidates[0].finish_reason is not None:
+                finish_reason = chunk.candidates[0].finish_reason.value
             if chunk.usage_metadata:
                 raw_usage = chunk.usage_metadata
 
@@ -165,10 +173,17 @@ class GeminiProvider(AIProviderBase):
         if usage is not None:
             usage.add(**usage_dict)
 
-        response = ProviderResponse(text="".join(text_parts), tool_calls=tool_calls, raw=None, usage=usage_dict)
+        response = ProviderResponse(
+            text="".join(text_parts), tool_calls=tool_calls, raw=None, usage=usage_dict, finish_reason=finish_reason,
+        )
         if response.requires_tool_execution and tool_executor:
             text = await run_agent_loop(
                 self, assistant, messages, system, tools, tool_executor,
                 initial_response=response, usage=usage, on_tool_call=on_tool_call,
             )
             yield text
+        else:
+            # No tool call this turn, so run_agent_loop (which does its own
+            # check on the final response) never runs — this is the only
+            # place a plain streamed reply's finish_reason is ever seen.
+            warn_if_finish_reason_suspicious(response)

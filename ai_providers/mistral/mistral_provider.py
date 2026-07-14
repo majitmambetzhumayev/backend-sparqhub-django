@@ -5,7 +5,9 @@ from mistralai.client import Mistral
 from django.conf import settings
 
 from ai_providers.agent_loop import run_agent_loop
-from ai_providers.base import AIProviderBase, ProviderResponse, ToolCall, UsageAccumulator
+from ai_providers.base import (
+    AIProviderBase, ProviderResponse, ToolCall, UsageAccumulator, warn_if_finish_reason_suspicious,
+)
 
 
 class MistralProvider(AIProviderBase):
@@ -60,7 +62,10 @@ class MistralProvider(AIProviderBase):
             for call in (message.tool_calls or [])
         ]
         usage = {"input_tokens": raw.usage.prompt_tokens, "output_tokens": raw.usage.completion_tokens}
-        return ProviderResponse(text=message.content or "", tool_calls=tool_calls, raw=raw, usage=usage)
+        return ProviderResponse(
+            text=message.content or "", tool_calls=tool_calls, raw=raw, usage=usage,
+            finish_reason=raw.choices[0].finish_reason,
+        )
 
     async def complete(self, assistant, messages, system, tools) -> ProviderResponse:
         kwargs = self._build_kwargs(assistant, messages, system, tools)
@@ -96,6 +101,7 @@ class MistralProvider(AIProviderBase):
         text_parts = []
         tool_call_chunks: dict[int, dict] = {}
         raw_usage = None
+        finish_reason = None
 
         event_stream = await self.client.chat.stream_async(**kwargs)
         async for event in event_stream:
@@ -104,6 +110,8 @@ class MistralProvider(AIProviderBase):
                 raw_usage = chunk.usage
             if not chunk.choices:
                 continue
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
             delta = chunk.choices[0].delta
             if delta.content:
                 text_parts.append(delta.content)
@@ -142,6 +150,7 @@ class MistralProvider(AIProviderBase):
             tool_calls=tool_calls,
             raw=SimpleNamespace(choices=[SimpleNamespace(message=raw_message)]),
             usage=usage_dict,
+            finish_reason=finish_reason,
         )
         if response.requires_tool_execution and tool_executor:
             text = await run_agent_loop(
@@ -149,3 +158,8 @@ class MistralProvider(AIProviderBase):
                 initial_response=response, usage=usage, on_tool_call=on_tool_call,
             )
             yield text
+        else:
+            # No tool call this turn, so run_agent_loop (which does its own
+            # check on the final response) never runs — this is the only
+            # place a plain streamed reply's finish_reason is ever seen.
+            warn_if_finish_reason_suspicious(response)

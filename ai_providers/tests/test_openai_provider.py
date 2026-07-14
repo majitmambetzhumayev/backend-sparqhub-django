@@ -24,9 +24,9 @@ class _FakeStream:
             yield chunk
 
 
-def _make_chunk(content=None, tool_call_deltas=None, usage=None):
+def _make_chunk(content=None, tool_call_deltas=None, usage=None, finish_reason=None):
     delta = MagicMock(content=content, tool_calls=tool_call_deltas)
-    choice = MagicMock(delta=delta)
+    choice = MagicMock(delta=delta, finish_reason=finish_reason)
     return MagicMock(choices=[choice], usage=usage)
 
 
@@ -44,9 +44,9 @@ class OpenAIProviderCompleteTest(SimpleTestCase):
         self.assistant.model = 'gpt-5.4'
         self.assistant.instructions = 'Be helpful.'
 
-    def _make_text_response(self, text: str, prompt_tokens=10, completion_tokens=5):
+    def _make_text_response(self, text: str, prompt_tokens=10, completion_tokens=5, finish_reason='stop'):
         message = MagicMock(content=text, tool_calls=None)
-        choice = MagicMock(message=message)
+        choice = MagicMock(message=message, finish_reason=finish_reason)
         usage = MagicMock(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
         return MagicMock(choices=[choice], usage=usage)
 
@@ -55,7 +55,7 @@ class OpenAIProviderCompleteTest(SimpleTestCase):
         function.name = name
         tool_call = MagicMock(id=call_id, function=function)
         message = MagicMock(content=None, tool_calls=[tool_call])
-        choice = MagicMock(message=message)
+        choice = MagicMock(message=message, finish_reason='tool_calls')
         usage = MagicMock(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
         return MagicMock(choices=[choice], usage=usage)
 
@@ -101,6 +101,13 @@ class OpenAIProviderCompleteTest(SimpleTestCase):
         result = run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Hi'}], 'sys', None))
         self.assertEqual(result.usage, {'input_tokens': 42, 'output_tokens': 17})
 
+    def test_complete_captures_finish_reason(self):
+        self.provider.client.chat.completions.create = AsyncMock(
+            return_value=self._make_text_response('Cut off...', finish_reason='length')
+        )
+        result = run(self.provider.complete(self.assistant, [{'role': 'user', 'content': 'Hi'}], 'sys', None))
+        self.assertEqual(result.finish_reason, 'length')
+
     def test_append_turn_builds_tool_message(self):
         raw = self._make_tool_call_response('call_xyz', 'my_tool', {})
         response = ProviderResponse(text='', tool_calls=[ToolCall(id='call_xyz', name='my_tool', arguments={})], raw=raw)
@@ -129,7 +136,7 @@ class OpenAIProviderStreamTest(SimpleTestCase):
         chunks = [
             _make_chunk(content='Hel'),
             _make_chunk(content='lo!'),
-            _make_chunk(content=None, usage=MagicMock(prompt_tokens=8, completion_tokens=3)),
+            _make_chunk(content=None, usage=MagicMock(prompt_tokens=8, completion_tokens=3), finish_reason='stop'),
         ]
         self.provider.client.chat.completions.create = AsyncMock(return_value=_FakeStream(chunks))
         usage = UsageAccumulator()
@@ -142,12 +149,24 @@ class OpenAIProviderStreamTest(SimpleTestCase):
         self.assertEqual(usage.input_tokens, 8)
         self.assertEqual(usage.output_tokens, 3)
 
+    def test_stream_warns_on_suspicious_finish_reason_with_no_tool_use(self):
+        # Regression test: a plain streamed reply with no tool call never
+        # reaches run_agent_loop (which does its own check) — this is the
+        # only place such a response's finish_reason is ever inspected.
+        chunks = [_make_chunk(content='Cut off', finish_reason='length')]
+        self.provider.client.chat.completions.create = AsyncMock(return_value=_FakeStream(chunks))
+
+        with self.assertLogs('ai_providers.base', level='WARNING'):
+            run(self._collect(self.provider.stream(
+                self.assistant, [{'role': 'user', 'content': 'Hi'}], 'sys', None, tool_executor=None,
+            )))
+
     def test_stream_accumulates_fragmented_tool_call_and_runs_agent_loop(self):
         chunks = [
             _make_chunk(tool_call_deltas=[_make_tool_call_delta(0, call_id='call_1', name='get_')]),
             _make_chunk(tool_call_deltas=[_make_tool_call_delta(0, name='data', arguments='{"a"')]),
             _make_chunk(tool_call_deltas=[_make_tool_call_delta(0, arguments=': 1}')]),
-            _make_chunk(usage=MagicMock(prompt_tokens=5, completion_tokens=2)),
+            _make_chunk(usage=MagicMock(prompt_tokens=5, completion_tokens=2), finish_reason='tool_calls'),
         ]
         self.provider.client.chat.completions.create = AsyncMock(return_value=_FakeStream(chunks))
 
