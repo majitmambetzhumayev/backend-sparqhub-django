@@ -231,13 +231,20 @@ class GetOrCreateThreadProjectTest(TestCase):
 
         self.assertEqual(thread.project_id, project.id)
 
-    def test_silently_ignores_unowned_project_id(self):
+    def test_rejects_unowned_project_id(self):
+        # Used to silently create a project-less thread instead — a 200 the
+        # caller had no way to tell apart from "no project_id was ever
+        # sent." An unresolvable/unauthorized project_id must be rejected,
+        # not dropped.
         other_user = User.objects.create_user(username='otherowner2', password='pass')
         other_project = Project.objects.create(user=other_user, name="Not yours")
 
-        thread = get_or_create_thread(self.user, project_id=other_project.id)
+        with self.assertRaises(Project.DoesNotExist):
+            get_or_create_thread(self.user, project_id=other_project.id)
 
-        self.assertIsNone(thread.project_id)
+    def test_rejects_nonexistent_project_id(self):
+        with self.assertRaises(Project.DoesNotExist):
+            get_or_create_thread(self.user, project_id=999999)
 
     def test_no_project_id_leaves_thread_unassigned(self):
         thread = get_or_create_thread(self.user)

@@ -17,6 +17,7 @@ from chat_messages import generation_registry
 from chat_messages.consumers import ConversationConsumer
 from chat_messages.models import Message
 from chat_messages.services import send_message, _record_turn
+from projects.models import Project
 from threads.models import Thread
 
 User = get_user_model()
@@ -523,6 +524,37 @@ class ConversationConsumerTest(TransactionTestCase):
         # actually released.
         self.assertEqual(second_frame, {"status": "thinking"})
 
+    def test_rejects_unowned_project_id_on_new_thread_creation(self):
+        # Regression test: get_or_create_thread used to silently drop an
+        # unresolvable/unauthorized project_id and create a project-less
+        # thread anyway (200-equivalent success) — now it raises
+        # Project.DoesNotExist, which must surface as a clean error frame
+        # here rather than falling into the generic P0 handler's vague
+        # "Something went wrong" message.
+        other_user = User.objects.create_user(username="otherprojectowner", password="pass")
+        other_project = Project.objects.create(user=other_user, name="Not yours")
+        # setUp already creates self.existing_thread for self.user — capture
+        # the baseline so we can assert no *new* thread got created, rather
+        # than assuming zero.
+        threads_before = Thread.objects.filter(user=self.user).count()
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to(
+                {"thread_id": None, "message": "Hi", "project_id": other_project.id},
+            )
+            error_frame = await communicator.receive_json_from()
+            await communicator.disconnect()
+            return error_frame
+
+        error_frame = run(scenario())
+        self.assertEqual(error_frame, {"error": "Project not found."})
+        self.assertEqual(Thread.objects.filter(user=self.user).count(), threads_before)
+
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
@@ -898,3 +930,19 @@ class SendMessageAPICreditsTest(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_402_PAYMENT_REQUIRED)
         self.assertEqual(response.data["error"], "Crédit épuisé.")
+
+    def test_returns_404_for_unowned_project_id(self):
+        # Regression test: an unresolvable/unauthorized project_id used to
+        # be silently dropped by get_or_create_thread, creating a
+        # project-less thread and returning 200 — no signal the caller's
+        # intended project association had failed.
+        other_user = User.objects.create_user(username="otherprojectowner2", password="pass")
+        other_project = Project.objects.create(user=other_user, name="Not yours")
+
+        response = self.client.post(
+            reverse('message-list-create-thread'), {"message": "Hi", "project_id": other_project.id}, format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.data["error"], "Project not found.")
+        self.assertEqual(Thread.objects.filter(user=self.user).count(), 0)
