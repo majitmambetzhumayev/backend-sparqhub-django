@@ -1,3 +1,5 @@
+import logging
+
 from authlib.integrations.base_client import OAuthError
 from django.contrib.auth import get_user_model
 from django.shortcuts import redirect
@@ -25,6 +27,8 @@ from .services import (
     request_password_reset,
     send_confirmation_email,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _set_auth_cookies(response, access, refresh=None):
@@ -176,7 +180,14 @@ class OAuthCallbackAPIView(APIView):
         client = oauth.create_client(provider)
         try:
             token = client.authorize_access_token(request)
-        except OAuthError:
+        except OAuthError as exc:
+            # Deliberately not logger.exception: this fires on ordinary user
+            # actions too (cancelling the provider's consent screen), not
+            # just misconfiguration/outages — but a warning still leaves a
+            # trace to distinguish "a lot of users are cancelling" from "the
+            # client secret/redirect URI is broken," which used to be
+            # completely invisible either way.
+            logger.warning("OAuth callback failed for provider %s: %s", provider, exc)
             return redirect(f"{settings.FRONTEND_URL.rstrip('/')}/auth/login?error=oauth_failed")
 
         if provider == 'google':

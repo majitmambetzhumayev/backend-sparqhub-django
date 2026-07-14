@@ -1,9 +1,14 @@
+import logging
 from http.cookies import SimpleCookie
 
 from channels.db import database_sync_to_async
 from django.contrib.auth.models import AnonymousUser
+from rest_framework.exceptions import AuthenticationFailed
+from rest_framework_simplejwt.exceptions import InvalidToken
 
 from users.authentication import CookieJWTAuthentication
+
+logger = logging.getLogger(__name__)
 
 
 class JWTAuthMiddleware:
@@ -35,5 +40,13 @@ class JWTAuthMiddleware:
         try:
             validated_token = auth.get_validated_token(cookies["access_token"].value)
             return auth.get_user(validated_token)
+        except (InvalidToken, AuthenticationFailed):
+            # Expired/malformed token, unknown/inactive user — the everyday
+            # "not really logged in" case, not worth logging.
+            return AnonymousUser()
         except Exception:
+            # Anything else (e.g. a DB error resolving the user) is not an
+            # expected auth failure and would otherwise vanish with zero
+            # trace, indistinguishable from a normal anonymous connection.
+            logger.exception("Unexpected error authenticating WebSocket connection")
             return AnonymousUser()

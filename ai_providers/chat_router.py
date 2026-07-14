@@ -41,23 +41,32 @@ async def _get_mcp_context(project_id) -> tuple[list[dict], object]:
     for server in servers:
         try:
             tools = await get_tools_from_server(server)
-            for tool in tools:
-                # First server to expose a given name wins, and is the only one
-                # advertised — keeps the tools list and the dispatch map
-                # consistent (previously the map kept the *last* server while
-                # the list still advertised every duplicate, so a name
-                # collision across two servers silently routed calls to
-                # whichever server happened to be processed last).
-                if tool["name"] in tool_server_map:
-                    logger.warning(
-                        "MCP tool name collision on %r between servers %s and %s; keeping %s",
-                        tool["name"], tool_server_map[tool["name"]].name, server.name, tool_server_map[tool["name"]].name,
-                    )
-                    continue
-                tool_server_map[tool["name"]] = server
-                all_tools.append(tool)
         except Exception:
-            logger.warning("Failed to fetch tools from MCP server %s", server.name)
+            # logger.exception (not .warning): this is a network call, and
+            # the traceback (timeout vs. auth failure vs. a bug in
+            # get_tools_from_server) is exactly what's needed to diagnose
+            # it — a bare "failed to fetch" with no cause was previously all
+            # that made it into the logs. Scoped to only this call, not the
+            # bookkeeping below, so a local bug there isn't misattributed as
+            # a fetch failure.
+            logger.exception("Failed to fetch tools from MCP server %s", server.name)
+            continue
+
+        for tool in tools:
+            # First server to expose a given name wins, and is the only one
+            # advertised — keeps the tools list and the dispatch map
+            # consistent (previously the map kept the *last* server while
+            # the list still advertised every duplicate, so a name
+            # collision across two servers silently routed calls to
+            # whichever server happened to be processed last).
+            if tool["name"] in tool_server_map:
+                logger.warning(
+                    "MCP tool name collision on %r between servers %s and %s; keeping %s",
+                    tool["name"], tool_server_map[tool["name"]].name, server.name, tool_server_map[tool["name"]].name,
+                )
+                continue
+            tool_server_map[tool["name"]] = server
+            all_tools.append(tool)
 
     if not all_tools:
         return [], None
