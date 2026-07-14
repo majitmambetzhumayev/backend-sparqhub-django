@@ -29,8 +29,13 @@ def process_project_file_task(file_id: int) -> None:
 
         data = default_storage.open(file_obj.storage_key).read()
         if file_obj.content_type in IMAGE_CONTENT_TYPES:
+            # generate_thumbnail always outputs JPEG for a JPEG source, PNG
+            # for everything else (png/webp/gif) — see its own docstring.
+            thumbnail_content_type = 'image/jpeg' if file_obj.content_type == 'image/jpeg' else 'image/png'
             thumb_key = save_uploaded_file_bytes(
-                generate_thumbnail(data, file_obj.content_type), f"thumb_{file_obj.original_filename}",
+                generate_thumbnail(data, file_obj.content_type),
+                f"thumb_{file_obj.original_filename}",
+                thumbnail_content_type,
             )
             file_obj.thumbnail_storage_key = thumb_key
         else:

@@ -22,7 +22,13 @@ def save_generated_image(data: bytes, mime_type: str) -> str:
     WS consumer) with no HTTP request object to derive an absolute URL from."""
     extension = _EXTENSION_BY_MIME_TYPE.get(mime_type, "png")
     filename = f"generated_images/{uuid.uuid4()}.{extension}"
-    saved_path = default_storage.save(filename, ContentFile(data))
+    # Set explicitly rather than left for mimetypes.guess_type(filename) to
+    # infer from the extension — see project_files/services.py's
+    # save_uploaded_file_bytes for why that fallback matters (falls through
+    # to "application/octet-stream" for some extensions, sniffable as HTML).
+    content = ContentFile(data)
+    content.content_type = mime_type
+    saved_path = default_storage.save(filename, content)
     url = default_storage.url(saved_path)
     if not urlparse(url).netloc:
         url = f"{settings.BACKEND_URL.rstrip('/')}/{url.lstrip('/')}"
