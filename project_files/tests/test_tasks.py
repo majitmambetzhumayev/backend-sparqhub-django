@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
+from django.db.utils import OperationalError
 from django.test import TestCase
 
 from project_files.models import ProjectFile, ProjectFileChunk
@@ -72,6 +73,32 @@ class ProcessProjectFileTaskTest(TestCase):
 
     def test_missing_file_row_logs_and_returns_without_raising(self):
         process_project_file_task(999999)  # must not raise
+
+    def test_failure_flipping_status_to_processing_still_marks_file_failed(self):
+        # Regression test: the status='processing' save() used to sit outside
+        # the try/except — if THAT specific save failed (a transient DB
+        # blip), the file was left stuck at 'pending' forever with no
+        # error_message, defeating the whole point of this task not
+        # swallowing failures silently (unlike librarian's task).
+        file_obj = ProjectFile.objects.create(
+            project=self.project, original_filename='notes.txt', content_type='text/plain', size_bytes=11,
+            storage_key='project_files/notes.txt',
+        )
+        real_save = ProjectFile.save
+        calls = {'n': 0}
+
+        def flaky_save(self, *args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise OperationalError('db connection blip')
+            return real_save(self, *args, **kwargs)
+
+        with patch.object(ProjectFile, 'save', flaky_save):
+            process_project_file_task(file_obj.id)  # must not raise
+
+        file_obj.refresh_from_db()
+        self.assertEqual(file_obj.status, 'failed')
+        self.assertIn('db connection blip', file_obj.error_message)
 
     @patch('project_files.tasks.embed_batch')
     @patch('project_files.tasks.default_storage')
