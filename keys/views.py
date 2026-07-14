@@ -1,5 +1,5 @@
 # keys/views.py
-from rest_framework import viewsets
+from rest_framework import mixins, viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
@@ -7,7 +7,19 @@ from .models import APIKey
 from .serializers import APIKeySerializer, APIKeyWriteSerializer
 from .services import create_or_update_user_api_key
 
-class APIKeyViewSet(viewsets.ModelViewSet):
+class APIKeyViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """No update/partial_update — deliberately not a full ModelViewSet.
+    Rotating a key's secret is done by POSTing the same key_type again
+    (create_or_update_user_api_key upserts on (user, key_type)); there is
+    no legitimate PUT/PATCH use case, and allowing one let key_type be
+    relabeled on an existing row without ever touching the actual secret,
+    silently mislabeling which provider a credential belongs to."""
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):

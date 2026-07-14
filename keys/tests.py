@@ -80,6 +80,21 @@ class APIKeyAPITest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(APIKey.objects.filter(pk=key.id).exists())
 
+    def test_no_update_capability(self):
+        # Regression test: PATCH used to be allowed via ModelViewSet's
+        # default update mixin, letting key_type be relabeled on an
+        # existing row without touching the actual secret — mislabeling a
+        # credential as belonging to a different provider. Rotating a
+        # key's secret is meant to happen via POST (upsert), not PUT/PATCH.
+        key = create_or_update_user_api_key(self.user, 'anthropic', "sk-secret")
+        detail_url = reverse('apikey-detail', kwargs={'pk': key.id})
+
+        response = self.client.patch(detail_url, {"key_type": "openai"}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        key.refresh_from_db()
+        self.assertEqual(key.key_type, 'anthropic')
+
     def test_only_returns_own_keys(self):
         other_user = User.objects.create_user(username='otheruser', password='testpass')
         create_or_update_user_api_key(other_user, 'anthropic', "sk-other")
