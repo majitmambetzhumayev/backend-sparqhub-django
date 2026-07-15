@@ -113,14 +113,17 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
 
     async def track_tool_call(tool_name):
         tool_calls.append(tool_name)
-        await channel_layer.group_send(group_name, {"type": "chat.status", "status": "tool_call", "tool": tool_name})
+        await channel_layer.group_send(
+            group_name, {"type": "chat.status", "status": "tool_call", "tool": tool_name, "thread_id": thread.id},
+        )
 
     async def track_delegate_start(provider_label):
         # The delegated call (a fresh, one-shot send_chat_message) used to
         # run completely silently — status just sat on "thinking" for the
         # whole round-trip, indistinguishable from a normal short pause.
         await channel_layer.group_send(
-            group_name, {"type": "chat.status", "status": "delegating", "provider": provider_label},
+            group_name,
+            {"type": "chat.status", "status": "delegating", "provider": provider_label, "thread_id": thread.id},
         )
 
     async def confirm_tool_call(tool_name, arguments):
@@ -163,13 +166,13 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         )
         async for chunk in chunks:
             collected.append(chunk)
-            await channel_layer.group_send(group_name, {"type": "chat.chunk", "chunk": chunk})
+            await channel_layer.group_send(group_name, {"type": "chat.chunk", "chunk": chunk, "thread_id": thread.id})
         assistant_text = "".join(collected)
         await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls)
         if used_global_key:
             await _deduct_credits_after_persisted_turn(user, thread, usage)
     except InsufficientCreditsError as exc:
-        await channel_layer.group_send(group_name, {"type": "chat.error", "error": str(exc)})
+        await channel_layer.group_send(group_name, {"type": "chat.error", "error": str(exc), "thread_id": thread.id})
         return
     except asyncio.CancelledError:
         # ConversationConsumer._stop_generation cancelling the registered
@@ -191,7 +194,11 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         logger.exception("Error while streaming chat response for thread %s", thread.id)
         await channel_layer.group_send(
             group_name,
-            {"type": "chat.error", "error": "Something went wrong while generating the response. Please try again."},
+            {
+                "type": "chat.error",
+                "error": "Something went wrong while generating the response. Please try again.",
+                "thread_id": thread.id,
+            },
         )
         return
     finally:
