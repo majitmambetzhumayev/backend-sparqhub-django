@@ -28,11 +28,6 @@ def get_embed_client() -> Mistral:
     return Mistral(api_key=settings.MISTRAL_API_KEY)
 
 
-def embed(text: str) -> list[float]:
-    response = get_embed_client().embeddings.create(model=EMBED_MODEL, inputs=[text])
-    return response.data[0].embedding
-
-
 def embed_batch(texts: list[str]) -> list[list[float]]:
     """One API call for many texts — used when embedding a document's
     chunks, where embedding one at a time would mean one round-trip per
@@ -41,3 +36,7 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
         return []
     response = get_embed_client().embeddings.create(model=EMBED_MODEL, inputs=texts)
     return [item.embedding for item in response.data]
+
+
+def embed(text: str) -> list[float]:
+    return embed_batch([text])[0]
