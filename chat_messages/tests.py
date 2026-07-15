@@ -265,12 +265,14 @@ class ConversationConsumerTest(TransactionTestCase):
             return frames
 
         frames = run(scenario())
-        self.assertEqual(frames[0], {"status": "thinking"})
-        self.assertEqual(frames[1], {"chunk": "Hel"})
-        self.assertEqual(frames[2], {"chunk": "lo!"})
+        thread_id = frames[0]["thread_id"]
+        self.assertEqual(frames[0], {"status": "thinking", "thread_id": thread_id})
+        self.assertEqual(frames[1], {"chunk": "Hel", "thread_id": thread_id})
+        self.assertEqual(frames[2], {"chunk": "lo!", "thread_id": thread_id})
         self.assertEqual(frames[3]["done"], True)
+        self.assertEqual(frames[3]["thread_id"], thread_id)
 
-        thread = Thread.objects.get(pk=frames[3]["thread_id"])
+        thread = Thread.objects.get(pk=thread_id)
         self.assertEqual(thread.conversation_state[-1], {"role": "assistant", "content": "Hello!"})
         self.assertTrue(thread.assistant.is_persistent)
 
@@ -301,12 +303,14 @@ class ConversationConsumerTest(TransactionTestCase):
             return frames
 
         frames = run(scenario())
-        self.assertEqual(frames[0], {"status": "thinking"})
-        self.assertEqual(frames[1], {"status": "tool_call", "tool": "search_memories"})
-        self.assertEqual(frames[2], {"chunk": "Done."})
+        thread_id = frames[0]["thread_id"]
+        self.assertEqual(frames[0], {"status": "thinking", "thread_id": thread_id})
+        self.assertEqual(frames[1], {"status": "tool_call", "tool": "search_memories", "thread_id": thread_id})
+        self.assertEqual(frames[2], {"chunk": "Done.", "thread_id": thread_id})
         self.assertEqual(frames[3]["done"], True)
+        self.assertEqual(frames[3]["thread_id"], thread_id)
 
-        thread = Thread.objects.get(pk=frames[3]["thread_id"])
+        thread = Thread.objects.get(pk=thread_id)
         assistant_message = Message.objects.get(thread=thread, sender="assistant")
         self.assertEqual(assistant_message.tool_calls, ["search_memories"])
 
@@ -362,9 +366,9 @@ class ConversationConsumerTest(TransactionTestCase):
             return thinking_frame, rejection_frame, chunk_frame, done_frame
 
         thinking_frame, rejection_frame, chunk_frame, done_frame = run(scenario())
-        self.assertEqual(thinking_frame, {"status": "thinking"})
+        self.assertEqual(thinking_frame, {"status": "thinking", "thread_id": self.existing_thread.id})
         self.assertIn("error", rejection_frame)
-        self.assertEqual(chunk_frame, {"chunk": "Done."})
+        self.assertEqual(chunk_frame, {"chunk": "Done.", "thread_id": self.existing_thread.id})
         self.assertTrue(done_frame["done"])
         # send_chat_message was only ever invoked once — the second message
         # was rejected before spawning a competing turn.
@@ -416,7 +420,7 @@ class ConversationConsumerTest(TransactionTestCase):
             return thinking_frame, rejection_frame
 
         thinking_frame, rejection_frame = run(scenario())
-        self.assertEqual(thinking_frame, {"status": "thinking"})
+        self.assertEqual(thinking_frame, {"status": "thinking", "thread_id": thinking_frame["thread_id"]})
         self.assertIn("error", rejection_frame)
         self.assertEqual(mock_send.call_count, 1)
 
@@ -449,8 +453,9 @@ class ConversationConsumerTest(TransactionTestCase):
             return thinking_frame, error_frame
 
         thinking_frame, error_frame = run(scenario())
-        self.assertEqual(thinking_frame, {"status": "thinking"})
-        self.assertEqual(error_frame, {"error": "Crédit épuisé."})
+        thread_id = thinking_frame["thread_id"]
+        self.assertEqual(thinking_frame, {"status": "thinking", "thread_id": thread_id})
+        self.assertEqual(error_frame, {"error": "Crédit épuisé.", "thread_id": thread_id})
 
     @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
     @patch("chat_messages.services.send_chat_message", new_callable=AsyncMock)
@@ -472,8 +477,12 @@ class ConversationConsumerTest(TransactionTestCase):
             return thinking_frame, error_frame
 
         thinking_frame, error_frame = run(scenario())
-        self.assertEqual(thinking_frame, {"status": "thinking"})
-        self.assertEqual(error_frame, {"error": "Something went wrong while generating the response. Please try again."})
+        thread_id = thinking_frame["thread_id"]
+        self.assertEqual(thinking_frame, {"status": "thinking", "thread_id": thread_id})
+        self.assertEqual(
+            error_frame,
+            {"error": "Something went wrong while generating the response. Please try again.", "thread_id": thread_id},
+        )
 
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")
@@ -511,8 +520,9 @@ class ConversationConsumerTest(TransactionTestCase):
             return thinking_frame, chunk_frame, done_frame
 
         thinking_frame, chunk_frame, done_frame = run(scenario())
-        self.assertEqual(thinking_frame, {"status": "thinking"})
-        self.assertEqual(chunk_frame, {"chunk": "Hi there."})
+        thread_id = thinking_frame["thread_id"]
+        self.assertEqual(thinking_frame, {"status": "thinking", "thread_id": thread_id})
+        self.assertEqual(chunk_frame, {"chunk": "Hi there.", "thread_id": thread_id})
         self.assertTrue(done_frame["done"])
         # memories=[] was passed through despite the retrieval failure.
         self.assertEqual(mock_send.call_args.kwargs["memories"], [])
@@ -570,7 +580,7 @@ class ConversationConsumerTest(TransactionTestCase):
         # frame synchronously, before any "thinking" status — getting to
         # "thinking" proves try_claim succeeded, i.e. the earlier claim was
         # actually released.
-        self.assertEqual(second_frame, {"status": "thinking"})
+        self.assertEqual(second_frame, {"status": "thinking", "thread_id": self.existing_thread.id})
 
     @patch("chat_messages.consumers.check_rate_limit", return_value=False)
     def test_rejects_message_when_rate_limited(self, mock_check_rate_limit):
@@ -665,11 +675,12 @@ class ConversationConsumerTest(TransactionTestCase):
             return thinking_frame, confirm_frame, chunk_frame, done_frame
 
         thinking_frame, confirm_frame, chunk_frame, done_frame = run(scenario())
-        self.assertEqual(thinking_frame, {"status": "thinking"})
+        thread_id = confirm_frame["thread_id"]
+        self.assertEqual(thinking_frame, {"status": "thinking", "thread_id": thread_id})
         self.assertEqual(confirm_frame["status"], "confirm_required")
         self.assertEqual(confirm_frame["tool"], "delegate_to_model")
         self.assertEqual(confirm_frame["arguments"], {"provider": "gemini"})
-        self.assertEqual(chunk_frame, {"chunk": "Confirmed!"})
+        self.assertEqual(chunk_frame, {"chunk": "Confirmed!", "thread_id": thread_id})
         self.assertTrue(done_frame["done"])
 
     @patch("chat_messages.services.generate_thread_title_task")
@@ -705,10 +716,10 @@ class ConversationConsumerTest(TransactionTestCase):
             chunk_frame = await communicator.receive_json_from()
 
             await communicator.disconnect()
-            return chunk_frame
+            return confirm_frame, chunk_frame
 
-        chunk_frame = run(scenario())
-        self.assertEqual(chunk_frame, {"chunk": "Declined."})
+        confirm_frame, chunk_frame = run(scenario())
+        self.assertEqual(chunk_frame, {"chunk": "Declined.", "thread_id": confirm_frame["thread_id"]})
 
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")
@@ -822,9 +833,9 @@ class ConversationConsumerTest(TransactionTestCase):
             return resuming_frame, first_chunk, second_chunk, first_done, second_done
 
         resuming_frame, first_chunk, second_chunk, first_done, second_done = run(scenario())
-        self.assertEqual(resuming_frame, {"status": "resuming"})
-        self.assertEqual(first_chunk, {"chunk": "Live chunk"})
-        self.assertEqual(second_chunk, {"chunk": "Live chunk"})
+        self.assertEqual(resuming_frame, {"status": "resuming", "thread_id": self.existing_thread.id})
+        self.assertEqual(first_chunk, {"chunk": "Live chunk", "thread_id": self.existing_thread.id})
+        self.assertEqual(second_chunk, {"chunk": "Live chunk", "thread_id": self.existing_thread.id})
         self.assertTrue(first_done["done"])
         self.assertTrue(second_done["done"])
 
@@ -896,7 +907,7 @@ class ConversationConsumerTest(TransactionTestCase):
         self.assertEqual(resurfaced_frame["status"], "confirm_required")
         self.assertEqual(resurfaced_frame["tool"], "delegate_to_model")
         self.assertEqual(resurfaced_frame["arguments"], {"provider": "gemini"})
-        self.assertEqual(first_chunk, {"chunk": "Confirmed!"})
+        self.assertEqual(first_chunk, {"chunk": "Confirmed!", "thread_id": self.existing_thread.id})
 
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")
@@ -933,7 +944,7 @@ class ConversationConsumerTest(TransactionTestCase):
             return chunk_frame, done_frame
 
         chunk_frame, done_frame = run(scenario())
-        self.assertEqual(chunk_frame, {"chunk": "Hello"})
+        self.assertEqual(chunk_frame, {"chunk": "Hello", "thread_id": self.existing_thread.id})
         self.assertEqual(done_frame, {"done": True, "thread_id": self.existing_thread.id, "stopped": True})
 
         self.assertEqual(Message.objects.filter(thread=self.existing_thread).count(), 2)
@@ -1000,7 +1011,7 @@ class ConversationConsumerTest(TransactionTestCase):
 
         attacker_frame, chunk_frame = run(scenario())
         self.assertIn("error", attacker_frame)
-        self.assertEqual(chunk_frame, {"chunk": "Confirmed!"})
+        self.assertEqual(chunk_frame, {"chunk": "Confirmed!", "thread_id": self.existing_thread.id})
 
     def test_stop_generation_rejects_a_thread_belonging_to_another_user(self):
         other_user = User.objects.create_user(username="otheruser2", password="pass")

@@ -183,7 +183,7 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                 "thread_id": thread_id,
             })
         else:
-            await self._safe_send({"status": "resuming"})
+            await self._safe_send({"status": "resuming", "thread_id": thread_id})
 
     async def _confirm_tool(self, thread_id, confirmed: bool) -> None:
         if thread_id is None:
@@ -302,7 +302,9 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                 # chat.error ever reaching the client (silent, permanent hang).
                 logger.exception("Failed to retrieve memories for user %s; continuing without them", user.id)
                 memories = []
-            await self.channel_layer.group_send(group_name, {"type": "chat.status", "status": "thinking"})
+            await self.channel_layer.group_send(
+                group_name, {"type": "chat.status", "status": "thinking", "thread_id": thread.id},
+            )
 
             await run_and_broadcast_turn(thread, message_text, user, group_name, memories=memories)
         except Exception:
@@ -336,10 +338,10 @@ class ConversationConsumer(AsyncWebsocketConsumer):
     # group, via the already-hardened _safe_send.
 
     async def chat_chunk(self, event):
-        await self._safe_send({"chunk": event["chunk"]})
+        await self._safe_send({"chunk": event["chunk"], "thread_id": event["thread_id"]})
 
     async def chat_status(self, event):
-        payload = {"status": event["status"]}
+        payload = {"status": event["status"], "thread_id": event["thread_id"]}
         if "tool" in event:
             payload["tool"] = event["tool"]
         if "provider" in event:
@@ -361,4 +363,4 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         await self._safe_send(payload)
 
     async def chat_error(self, event):
-        await self._safe_send({"error": event["error"]})
+        await self._safe_send({"error": event["error"], "thread_id": event["thread_id"]})
