@@ -166,6 +166,7 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         )
         async for chunk in chunks:
             collected.append(chunk)
+            generation_registry.append_streamed_chunk(thread.id, chunk)
             await channel_layer.group_send(group_name, {"type": "chat.chunk", "chunk": chunk, "thread_id": thread.id})
         assistant_text = "".join(collected)
         await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls)

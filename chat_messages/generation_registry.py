@@ -27,6 +27,14 @@ class _PendingConfirmation:
 class _Generation:
     task: asyncio.Task | None = None
     pending_confirmation: "_PendingConfirmation | None" = None
+    # Nothing is persisted to the DB mid-turn (_record_turn only runs once
+    # the whole reply is done) — these two fields are the only record of an
+    # in-flight turn's progress, so a client that (re)joins mid-stream (e.g.
+    # navigated to another thread and back while this one was still
+    # generating) can be caught up instead of seeing neither the question
+    # nor the answer-so-far until the turn eventually finishes.
+    user_text: str = ""
+    streamed_text: str = ""
 
 
 _active: dict[int, _Generation] = {}
@@ -46,6 +54,30 @@ def try_claim(thread_id: int) -> bool:
 
 def attach_task(thread_id: int, task: asyncio.Task) -> None:
     _active[thread_id].task = task
+
+
+def set_turn_text(thread_id: int, user_text: str) -> None:
+    gen = _active.get(thread_id)
+    if gen is not None:
+        gen.user_text = user_text
+
+
+def append_streamed_chunk(thread_id: int, chunk: str) -> None:
+    gen = _active.get(thread_id)
+    if gen is not None:
+        gen.streamed_text += chunk
+
+
+def get_turn_progress(thread_id: int) -> tuple[str, str]:
+    """The user's message text and the assistant text streamed so far for a
+    still-active generation — used by ConversationConsumer._join_thread so a
+    client that (re)joins mid-turn sees what's already happened instead of
+    an empty screen until the whole turn finishes and _record_turn saves it.
+    Returns ("", "") if thread_id has no active generation."""
+    gen = _active.get(thread_id)
+    if gen is None:
+        return "", ""
+    return gen.user_text, gen.streamed_text
 
 
 def is_active(thread_id: int) -> bool:

@@ -169,6 +169,12 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         self._joined_groups.add(group_name)
         if not generation_registry.is_active(thread_id):
             return
+        # Nothing is persisted to the DB mid-turn, so this pair is the only
+        # record of what's happened so far — without it, a client that
+        # (re)joins mid-stream (navigated to another thread and back while
+        # this one was still generating) would see neither the question nor
+        # the answer-so-far until the whole turn eventually finishes.
+        user_text, streamed_text = generation_registry.get_turn_progress(thread_id)
         pending = generation_registry.get_pending_confirmation(thread_id)
         if pending is not None:
             # Re-send the same confirm_required prompt rather than a
@@ -181,9 +187,16 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                 "tool": pending.tool,
                 "arguments": pending.arguments,
                 "thread_id": thread_id,
+                "user_text": user_text,
+                "streamed_text": streamed_text,
             })
         else:
-            await self._safe_send({"status": "resuming", "thread_id": thread_id})
+            await self._safe_send({
+                "status": "resuming",
+                "thread_id": thread_id,
+                "user_text": user_text,
+                "streamed_text": streamed_text,
+            })
 
     async def _confirm_tool(self, thread_id, confirmed: bool) -> None:
         if thread_id is None:
@@ -286,6 +299,7 @@ class ConversationConsumer(AsyncWebsocketConsumer):
             # (nothing cancels either), and it's what a future
             # cancel/"stop generation" feature would target.
             generation_registry.attach_task(thread.id, asyncio.current_task())
+            generation_registry.set_turn_text(thread.id, message_text)
 
             group_name = f"thread_{thread.id}"
             await self.channel_layer.group_add(group_name, self.channel_name)

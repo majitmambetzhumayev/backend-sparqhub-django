@@ -833,11 +833,74 @@ class ConversationConsumerTest(TransactionTestCase):
             return resuming_frame, first_chunk, second_chunk, first_done, second_done
 
         resuming_frame, first_chunk, second_chunk, first_done, second_done = run(scenario())
-        self.assertEqual(resuming_frame, {"status": "resuming", "thread_id": self.existing_thread.id})
+        # No chunks have streamed yet at this point (send_chat_message
+        # itself is still blocked on release_call) — user_text is
+        # resurfaced, streamed_text is still empty.
+        self.assertEqual(
+            resuming_frame,
+            {"status": "resuming", "thread_id": self.existing_thread.id, "user_text": "Hi", "streamed_text": ""},
+        )
         self.assertEqual(first_chunk, {"chunk": "Live chunk", "thread_id": self.existing_thread.id})
         self.assertEqual(second_chunk, {"chunk": "Live chunk", "thread_id": self.existing_thread.id})
         self.assertTrue(first_done["done"])
         self.assertTrue(second_done["done"])
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
+    def test_join_thread_resurfaces_text_streamed_so_far(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # Regression test for the "navigate away mid-stream and back" gap:
+        # nothing is persisted to the DB until the whole turn finishes, so
+        # without this, a client that (re)joins mid-stream saw neither the
+        # question nor the answer generated so far — only chunks that
+        # happened to arrive after it rejoined.
+        release_rest = asyncio.Event()
+
+        async def fake_send_chat_message(*args, **kwargs):
+            async def fake_chunks():
+                yield "Hel"
+                await release_rest.wait()
+                yield "lo!"
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            first = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            first.scope["user"] = self.user
+            connected, _ = await first.connect()
+            assert connected
+
+            await first.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            await first.receive_json_from()  # thinking
+            await first.receive_json_from()  # "Hel" chunk
+
+            second = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            second.scope["user"] = self.user
+            connected2, _ = await second.connect()
+            assert connected2
+
+            await second.send_json_to({"type": "join_thread", "thread_id": self.existing_thread.id})
+            resuming_frame = await second.receive_json_from()
+
+            release_rest.set()
+            second_chunk = await second.receive_json_from()
+
+            await first.disconnect()
+            await second.disconnect()
+            return resuming_frame, second_chunk
+
+        resuming_frame, second_chunk = run(scenario())
+        self.assertEqual(resuming_frame["status"], "resuming")
+        self.assertEqual(resuming_frame["user_text"], "Hi")
+        self.assertEqual(resuming_frame["streamed_text"], "Hel")
+        # Only the remaining chunk arrives live — "Hel" was already caught
+        # up via the resuming frame, not resent as a chunk.
+        self.assertEqual(second_chunk, {"chunk": "lo!", "thread_id": self.existing_thread.id})
 
     def test_join_thread_rejects_a_thread_belonging_to_another_user(self):
         other_user = User.objects.create_user(username="otheruser", password="pass")
@@ -907,6 +970,11 @@ class ConversationConsumerTest(TransactionTestCase):
         self.assertEqual(resurfaced_frame["status"], "confirm_required")
         self.assertEqual(resurfaced_frame["tool"], "delegate_to_model")
         self.assertEqual(resurfaced_frame["arguments"], {"provider": "gemini"})
+        # No chunks streamed yet at this point (confirm_tool_call is awaited
+        # before the fake yields anything) — user_text is resurfaced, but
+        # streamed_text is still empty.
+        self.assertEqual(resurfaced_frame["user_text"], "Hi")
+        self.assertEqual(resurfaced_frame["streamed_text"], "")
         self.assertEqual(first_chunk, {"chunk": "Confirmed!", "thread_id": self.existing_thread.id})
 
     @patch("chat_messages.services.generate_thread_title_task")
