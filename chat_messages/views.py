@@ -1,3 +1,5 @@
+import logging
+
 from asgiref.sync import async_to_sync
 from django.views.decorators.csrf import csrf_protect
 from django.utils.decorators import method_decorator
@@ -13,6 +15,8 @@ from librarian.services import retrieve_relevant_memories
 from projects.models import Project
 from threads.models import Thread
 from threads.services import get_or_create_thread
+
+logger = logging.getLogger(__name__)
 
 
 @method_decorator(csrf_protect, name='dispatch')
@@ -55,7 +59,16 @@ class SendMessageAPIView(APIView):
         except Project.DoesNotExist:
             return Response({"error": "Project not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        memories = retrieve_relevant_memories(user, text)
+        try:
+            memories = retrieve_relevant_memories(user, text)
+        except Exception:
+            # Memory recall is a supplementary enrichment, not the core
+            # feature — degrade gracefully (e.g. a corrupted/mismatched
+            # embedding row for this user) rather than 500ing the whole
+            # request. Same fix already applied to the WS path in
+            # consumers.py after a real incident there.
+            logger.exception("Failed to retrieve memories for user %s; continuing without them", user.id)
+            memories = []
         try:
             response_text = async_to_sync(send_message)(thread, text, user, memories=memories)
         except InsufficientCreditsError as exc:

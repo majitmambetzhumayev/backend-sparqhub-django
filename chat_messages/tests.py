@@ -1155,6 +1155,25 @@ class SendMessageAPICreditsTest(APITestCase):
         self.assertEqual(response.data["error"], "Project not found.")
         self.assertEqual(Thread.objects.filter(user=self.user).count(), 0)
 
+    @patch("chat_messages.views.send_message", new_callable=AsyncMock)
+    @patch("chat_messages.views.retrieve_relevant_memories")
+    def test_completes_request_when_memory_retrieval_fails(self, mock_memories, mock_send):
+        # Regression test, mirroring the same fix already applied to the WS
+        # path (ConversationConsumerTest.test_completes_turn_when_memory_retrieval_fails):
+        # retrieve_relevant_memories used to be called with no try/except on
+        # this HTTP path either — an exception there (e.g. a corrupted/
+        # mismatched embedding row) would 500 the whole request instead of
+        # degrading gracefully.
+        mock_memories.side_effect = RuntimeError("vector dimension mismatch")
+        mock_send.return_value = "Hi there."
+
+        response = self.client.post(reverse('message-list-create-thread'), {"message": "Hi"}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["response"], "Hi there.")
+        # memories=[] was passed through despite the retrieval failure.
+        self.assertEqual(mock_send.call_args.kwargs["memories"], [])
+
 
 class SendMessageAPIRateLimitTest(APITestCase):
     def setUp(self):
