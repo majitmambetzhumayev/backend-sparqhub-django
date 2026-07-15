@@ -1,5 +1,6 @@
 # threads/tests.py
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from django.test import TestCase, SimpleTestCase
@@ -197,6 +198,28 @@ class ThreadDetailAPITest(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.thread.refresh_from_db()
         self.assertIsNone(self.thread.project_id)
+
+    def test_patch_bumps_updated_at_regardless_of_which_field_changed(self):
+        # Regression test: update_fields on these three save() calls omitted
+        # "updated_at", so Django's auto_now never actually persisted the new
+        # timestamp — renaming a thread, moving it to a project, or changing
+        # its provider/model silently didn't bump it to the top of the
+        # "most recently used first" conversation list. Same bug class
+        # already fixed once in chat_messages/services.py::_record_turn.
+        project = Project.objects.create(user=self.user, name="P")
+        for payload in (
+            {"title": "Renamed"},
+            {"project": project.id},
+            {"ai_provider": "anthropic", "model": "claude-opus-4-8"},
+        ):
+            before = self.thread.updated_at
+            time.sleep(1.1)
+            response = self.client.patch(
+                reverse('thread-detail', kwargs={'pk': self.thread.id}), data=payload, format='json',
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.thread.refresh_from_db()
+            self.assertGreater(self.thread.updated_at, before)
 
     def test_patch_rejects_another_users_project(self):
         other_user = User.objects.create_user(username='otherowner', password='pass')

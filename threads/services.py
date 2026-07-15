@@ -47,7 +47,7 @@ def update_thread_provider(thread: Thread, ai_provider: str, model: str) -> Thre
         raise ValueError(f"Unsupported model '{model}' for provider '{ai_provider}'")
     thread.ai_provider = ai_provider
     thread.model = model
-    thread.save(update_fields=["ai_provider", "model"])
+    thread.save(update_fields=["ai_provider", "model", "updated_at"])
     return thread
 
 

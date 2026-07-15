@@ -56,10 +56,10 @@ class ThreadDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
 
         if 'title' in data:
             thread.title = data['title']
-            thread.save(update_fields=['title'])
+            thread.save(update_fields=['title', 'updated_at'])
 
         if 'project' in data:
             thread.project = data['project']
-            thread.save(update_fields=['project'])
+            thread.save(update_fields=['project', 'updated_at'])
 
         return Response(ThreadDetailSerializer(thread).data)
