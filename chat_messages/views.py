@@ -10,13 +10,21 @@ from rest_framework import status
 from ai_providers.chat_router import InsufficientCreditsError
 from chat_messages.models import Message
 from chat_messages.serializers import MessageSerializer
-from chat_messages.services import send_message
+from chat_messages.services import get_usage_summary, send_message
 from librarian.services import retrieve_relevant_memories
 from projects.models import Project
 from threads.models import Thread
 from threads.services import get_or_create_thread
 
 logger = logging.getLogger(__name__)
+
+
+class UsageSummaryAPIView(APIView):
+    """GET /api/usage/summary/ — total token usage across every turn this
+    user has ever generated, for the dashboard's usage widget."""
+
+    def get(self, request, format=None):
+        return Response(get_usage_summary(request.user))
 
 
 @method_decorator(csrf_protect, name='dispatch')
