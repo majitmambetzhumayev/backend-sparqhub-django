@@ -13,12 +13,13 @@ from django.urls import reverse
 from rest_framework.test import APITestCase
 from rest_framework import status
 
+from ai_providers.base import UsageAccumulator
 from ai_providers.chat_router import InsufficientCreditsError
 from assistants.models import Assistant
 from chat_messages import generation_registry
 from chat_messages.consumers import ConversationConsumer
 from chat_messages.models import Message
-from chat_messages.services import send_message, _deduct_credits_after_persisted_turn, _record_turn
+from chat_messages.services import get_usage_summary, send_message, _deduct_credits_after_persisted_turn, _record_turn
 from projects.models import Project
 from threads.models import Thread
 
@@ -61,6 +62,19 @@ class SendMessageServiceTest(TransactionTestCase):
         mock_extract_task.delay.assert_called_once_with(
             self.thread.user_id, self.thread.assistant_id, "Hello", "Hi there!",
         )
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.services.send_chat_message", new_callable=AsyncMock)
+    def test_persists_token_usage_on_the_assistant_message_only(self, mock_send, mock_extract_task, mock_title_task):
+        mock_send.return_value = ("Hi there!", UsageAccumulator(input_tokens=100, output_tokens=50), False)
+
+        run(send_message(self.thread, "Hello", self.user))
+
+        user_message = Message.objects.get(thread=self.thread, sender="user")
+        assistant_message = Message.objects.get(thread=self.thread, sender="assistant")
+        self.assertEqual((user_message.input_tokens, user_message.output_tokens), (0, 0))
+        self.assertEqual((assistant_message.input_tokens, assistant_message.output_tokens), (100, 50))
 
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")
@@ -139,11 +153,12 @@ class SendMessageServiceTest(TransactionTestCase):
     @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.services.send_chat_message", new_callable=AsyncMock)
     def test_deducts_credits_when_global_key_used(self, mock_send, mock_extract_task, mock_deduct, mock_title_task):
-        mock_send.return_value = ("Hi there!", "usage-marker", True)
+        usage = UsageAccumulator(input_tokens=10, output_tokens=5)
+        mock_send.return_value = ("Hi there!", usage, True)
 
         run(send_message(self.thread, "Hello", self.user))
 
-        mock_deduct.assert_awaited_once_with(self.user, self.thread.ai_provider, self.thread.model, "usage-marker")
+        mock_deduct.assert_awaited_once_with(self.user, self.thread.ai_provider, self.thread.model, usage)
 
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.deduct_credits", new_callable=AsyncMock)
@@ -157,7 +172,7 @@ class SendMessageServiceTest(TransactionTestCase):
         # billing failure here must not turn a successful turn into a bare
         # 500, which would also invite a retry that pays for a second real
         # provider call while this one goes uncharged either way.
-        mock_send.return_value = ("Hi there!", "usage-marker", True)
+        mock_send.return_value = ("Hi there!", UsageAccumulator(input_tokens=10, output_tokens=5), True)
         mock_deduct.side_effect = RuntimeError("db blip")
 
         response_text = run(send_message(self.thread, "Hello", self.user))
@@ -170,7 +185,7 @@ class SendMessageServiceTest(TransactionTestCase):
     @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.services.send_chat_message", new_callable=AsyncMock)
     def test_does_not_deduct_credits_when_personal_key_used(self, mock_send, mock_extract_task, mock_deduct, mock_title_task):
-        mock_send.return_value = ("Hi there!", "usage-marker", False)
+        mock_send.return_value = ("Hi there!", UsageAccumulator(input_tokens=10, output_tokens=5), False)
 
         run(send_message(self.thread, "Hello", self.user))
 
@@ -226,6 +241,42 @@ class DeductCreditsAfterPersistedTurnTest(TransactionTestCase):
         run(_deduct_credits_after_persisted_turn(self.user, self.thread, "usage-marker"))
 
         mock_deduct.assert_awaited_once_with(self.user, self.thread.ai_provider, self.thread.model, "usage-marker")
+
+
+class GetUsageSummaryTest(TransactionTestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="usageuser", password="pass")
+        self.assistant = Assistant.objects.create(
+            user=self.user, name="Chat Assistant", instructions="Be concise.",
+        )
+        self.thread = Thread.objects.create(user=self.user, assistant=self.assistant, conversation_state=[])
+
+    def test_returns_zero_for_a_user_with_no_messages(self):
+        self.assertEqual(get_usage_summary(self.user), {"input_tokens": 0, "output_tokens": 0})
+
+    def test_sums_assistant_messages_only_across_threads(self):
+        other_thread = Thread.objects.create(user=self.user, assistant=self.assistant, conversation_state=[])
+        Message.objects.create(
+            thread=self.thread, sender="user", content="Hi", input_tokens=999, output_tokens=999,
+        )  # would corrupt the sum if the sender filter were dropped
+        Message.objects.create(
+            thread=self.thread, sender="assistant", content="Hello", input_tokens=100, output_tokens=50,
+        )
+        Message.objects.create(
+            thread=other_thread, sender="assistant", content="Hi again", input_tokens=20, output_tokens=10,
+        )
+
+        self.assertEqual(get_usage_summary(self.user), {"input_tokens": 120, "output_tokens": 60})
+
+    def test_excludes_other_users_messages(self):
+        other_user = User.objects.create_user(username="otherusageuser", password="pass")
+        other_assistant = Assistant.objects.create(user=other_user, name="A", instructions="")
+        other_thread = Thread.objects.create(user=other_user, assistant=other_assistant, conversation_state=[])
+        Message.objects.create(
+            thread=other_thread, sender="assistant", content="Hi", input_tokens=500, output_tokens=500,
+        )
+
+        self.assertEqual(get_usage_summary(self.user), {"input_tokens": 0, "output_tokens": 0})
 
 
 class ConversationConsumerTest(TransactionTestCase):
@@ -1173,6 +1224,36 @@ class SendMessageAPICreditsTest(APITestCase):
         self.assertEqual(response.data["response"], "Hi there.")
         # memories=[] was passed through despite the retrieval failure.
         self.assertEqual(mock_send.call_args.kwargs["memories"], [])
+
+
+class UsageSummaryAPITest(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="usageapiuser", password="pass")
+        self.client.force_authenticate(user=self.user)
+        self.assistant = Assistant.objects.create(user=self.user, name="A", instructions="")
+        self.thread = Thread.objects.create(user=self.user, assistant=self.assistant, conversation_state=[])
+
+    def test_returns_zero_for_a_user_with_no_messages(self):
+        response = self.client.get(reverse('usage-summary'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {"input_tokens": 0, "output_tokens": 0})
+
+    def test_returns_summed_totals(self):
+        Message.objects.create(
+            thread=self.thread, sender="assistant", content="Hi", input_tokens=100, output_tokens=50,
+        )
+
+        response = self.client.get(reverse('usage-summary'))
+
+        self.assertEqual(response.data, {"input_tokens": 100, "output_tokens": 50})
+
+    def test_requires_authentication(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.get(reverse('usage-summary'))
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
 class SendMessageAPIRateLimitTest(APITestCase):
