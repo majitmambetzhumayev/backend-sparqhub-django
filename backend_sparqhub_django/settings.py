@@ -37,10 +37,15 @@ if SENTRY_DSN:
 
 # Used to build absolute URLs for generated media (e.g. AI-generated images)
 # from contexts with no HTTP request object, like the WebSocket consumer.
-BACKEND_URL = config('BACKEND_URL', default='http://localhost:8000')
+# .strip() guards against a stray trailing newline/space from a pasted
+# platform env var value -- hit this for real once already: it survived
+# .rstrip('/') (rstrip only strips '/', not whitespace) all the way into a
+# redirect Location header as a literal %0A, which Chrome then rejected
+# outright with ERR_INVALID_REDIRECT.
+BACKEND_URL = config('BACKEND_URL', default='http://localhost:8000').strip()
 # Used to build links that must point at the frontend (password reset,
 # email confirmation) rather than this backend.
-FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000')
+FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000').strip()
 
 RESEND_API_KEY = config('RESEND_API_KEY', default='')
 DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='noreply@sparqup.fr')
