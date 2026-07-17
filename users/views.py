@@ -5,6 +5,7 @@ from django.contrib.auth import get_user_model
 from django.shortcuts import redirect
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 from rest_framework.response import Response
 from rest_framework.permissions import IsAdminUser, IsAuthenticated, AllowAny
 from rest_framework.views import APIView
@@ -55,8 +56,28 @@ class CookieTokenObtainPairView(TokenObtainPairView):
 @method_decorator(csrf_exempt, name='dispatch')
 class CookieTokenRefreshView(TokenRefreshView):
     def post(self, request, *args, **kwargs):
-        response = super().post(request, *args, **kwargs)
-        _set_auth_cookies(response, response.data['access'])
+        # The refresh token lives in an httpOnly cookie -- a browser client
+        # has no way to read it and include it in the request body the
+        # stock TokenRefreshSerializer expects, so it's read from the
+        # cookie directly here instead, mirroring CookieJWTAuthentication's
+        # own cookie fallback for the access token.
+        serializer = self.get_serializer(data={'refresh': request.COOKIES.get('refresh_token')})
+        try:
+            serializer.is_valid(raise_exception=True)
+        except TokenError as e:
+            # Mirrors the stock TokenViewBase.post(), bypassed by calling
+            # get_serializer()/is_valid() directly instead of super().post()
+            # -- without this, an invalid/blacklisted/expired token raises
+            # the low-level TokenError uncaught, producing a raw 500
+            # instead of a clean 401.
+            raise InvalidToken(e.args[0]) from e
+        response = Response(serializer.validated_data, status=status.HTTP_200_OK)
+        # ROTATE_REFRESH_TOKENS blacklists the old refresh token and issues
+        # a new one in this same response -- previously only the access
+        # cookie was re-set here, silently discarding the rotated refresh
+        # token, so exactly one refresh ever worked before the now-
+        # blacklisted old cookie broke every subsequent attempt.
+        _set_auth_cookies(response, serializer.validated_data['access'], serializer.validated_data.get('refresh'))
         return response
 
 

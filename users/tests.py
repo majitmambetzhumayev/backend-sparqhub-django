@@ -621,3 +621,58 @@ class CurrentUserOnboardingFieldTest(APITestCase):
         serializer.save()
         self.user.refresh_from_db()
         self.assertFalse(self.user.has_seen_onboarding)
+
+
+class CookieTokenRefreshTest(APITestCase):
+    # Regression tests: the refresh token lives in an httpOnly cookie, never
+    # in the request body -- a real browser client has no way to read it and
+    # can only ever rely on this endpoint pulling it from the cookie jar
+    # (self.client carries cookies across requests here exactly like a
+    # browser would).
+    def setUp(self):
+        cache.clear()
+        User.objects.create_user(username="refreshuser", password="pass", email_verified=True)
+        login_response = self.client.post(reverse('auth-login'), {"username": "refreshuser", "password": "pass"})
+        self.original_refresh_value = login_response.cookies['refresh_token'].value
+
+    def test_refresh_with_only_the_cookie_present_succeeds(self):
+        # No body at all -- exactly what a browser client can actually send.
+        response = self.client.post(reverse('auth-refresh'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access_token', response.cookies)
+
+    def test_rotated_refresh_token_is_re_cookied(self):
+        # ROTATE_REFRESH_TOKENS issues a new refresh token on every call --
+        # if it isn't re-cookied here, every session breaks after exactly
+        # one silent refresh.
+        response = self.client.post(reverse('auth-refresh'))
+
+        self.assertIn('refresh_token', response.cookies)
+        self.assertNotEqual(response.cookies['refresh_token'].value, self.original_refresh_value)
+
+    def test_old_refresh_token_is_blacklisted_after_rotation(self):
+        self.client.post(reverse('auth-refresh'))  # rotates -- old cookie value is now blacklisted
+
+        self.client.cookies['refresh_token'] = self.original_refresh_value
+        response = self.client.post(reverse('auth-refresh'))
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_refresh_with_no_cookie_at_all_is_rejected(self):
+        self.client.cookies.pop('refresh_token', None)
+
+        response = self.client.post(reverse('auth-refresh'))
+
+        # A missing value fails standard DRF field validation (refresh is a
+        # required CharField) before it ever reaches SimpleJWT's own
+        # token-parsing/InvalidToken path -- 400, not 401, and correctly so
+        # (malformed/absent input vs. a rejected credential).
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_refresh_with_invalid_token_is_rejected(self):
+        self.client.cookies['refresh_token'] = 'not-a-real-token'
+
+        response = self.client.post(reverse('auth-refresh'))
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
