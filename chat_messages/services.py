@@ -1,11 +1,14 @@
 import asyncio
 import logging
+from decimal import Decimal
 
 from asgiref.sync import sync_to_async
 from django.db import transaction
 from django.db.models import Sum
 
-from ai_providers.chat_router import InsufficientCreditsError, send_chat_message, deduct_credits
+from ai_providers.chat_router import (
+    InsufficientCreditsError, send_chat_message, deduct_credits, compute_turn_cost_usd,
+)
 from chat_messages.models import Message
 from librarian.tasks import extract_memories_task
 from threads.models import Thread
@@ -21,13 +24,21 @@ logger = logging.getLogger(__name__)
 CONFIRMATION_TIMEOUT_SECONDS = 300
 
 
-def _record_turn(thread, history, user_text, assistant_text, tool_calls=None, usage=None):
+def _record_turn(thread, history, user_text, assistant_text, tool_calls=None, usage=None, used_global_key=True):
+    # BYOK spend isn't deducted from credits at all (see the used_global_key
+    # gate in send_message/run_and_broadcast_turn below), so it's the one
+    # case where this turn's real USD cost needs computing here instead of
+    # being left to deduct_credits.
+    cost_usd = Decimal("0")
+    if not used_global_key:
+        cost_usd = Decimal(str(round(compute_turn_cost_usd(thread.ai_provider, thread.model, usage), 6)))
     Message.objects.bulk_create([
         Message(thread=thread, sender="user", content=user_text),
         Message(
             thread=thread, sender="assistant", content=assistant_text, tool_calls=tool_calls or [],
             input_tokens=usage.input_tokens if usage else 0,
             output_tokens=usage.output_tokens if usage else 0,
+            estimated_cost_usd=cost_usd,
         ),
     ])
     is_first_turn = not history
@@ -68,10 +79,12 @@ def get_usage_summary(user) -> dict:
     user, no messages yet), hence the `or 0`."""
     totals = Message.objects.filter(thread__user=user, sender="assistant").aggregate(
         input_tokens=Sum("input_tokens"), output_tokens=Sum("output_tokens"),
+        estimated_cost_usd=Sum("estimated_cost_usd"),
     )
     return {
         "input_tokens": totals["input_tokens"] or 0,
         "output_tokens": totals["output_tokens"] or 0,
+        "estimated_cost_usd": float(totals["estimated_cost_usd"] or 0),
     }
 
 
@@ -101,7 +114,7 @@ async def send_message(thread, text, user, memories=None) -> str:
         conversation_history=history, memories=memories, stream=False, project_id=thread.project_id,
         on_tool_call=track_tool_call,
     )
-    await sync_to_async(_record_turn)(thread, history, text, response_text, tool_calls, usage)
+    await sync_to_async(_record_turn)(thread, history, text, response_text, tool_calls, usage, used_global_key)
     if used_global_key:
         await _deduct_credits_after_persisted_turn(user, thread, usage)
     return response_text
@@ -189,7 +202,7 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
             generation_registry.append_streamed_chunk(thread.id, chunk)
             await channel_layer.group_send(group_name, {"type": "chat.chunk", "chunk": chunk, "thread_id": thread.id})
         assistant_text = "".join(collected)
-        await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls, usage)
+        await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls, usage, used_global_key)
         if used_global_key:
             await _deduct_credits_after_persisted_turn(user, thread, usage)
     except InsufficientCreditsError as exc:
@@ -206,7 +219,7 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         # state — nothing awaits it anyway (see ConversationConsumer).
         if collected:
             assistant_text = "".join(collected)
-            await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls, usage)
+            await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls, usage, used_global_key)
             if used_global_key:
                 await _deduct_credits_after_persisted_turn(user, thread, usage)
         await channel_layer.group_send(group_name, {"type": "chat.done", "thread_id": thread.id, "stopped": True})
