@@ -29,6 +29,12 @@ class Message(models.Model):
     # for a dashboard summary) without re-deriving it from provider calls.
     input_tokens = models.PositiveIntegerField(default=0)
     output_tokens = models.PositiveIntegerField(default=0)
+    # Real USD cost, computed from ai_providers PRICING tables -- only set
+    # when a personal (BYOK) key was used. Global-key turns deduct credits
+    # instead (see ai_providers.chat_router.deduct_credits) and leave this
+    # at 0, since that spend isn't paid directly by the user at the
+    # provider and is already tracked via credits_remaining.
+    estimated_cost_usd = models.DecimalField(max_digits=10, decimal_places=6, default=0)
 
     def __str__(self):
         return f"Message {self.id} in Thread {self.thread.id}"

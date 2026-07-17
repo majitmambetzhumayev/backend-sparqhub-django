@@ -256,9 +256,9 @@ def _build_delegate_tool(user, confirm_tool_call, on_tool_call=None, on_delegate
     return DELEGATE_TOOL, executor
 
 
-def _compute_cost_credits(provider_cls, model: str, usage: UsageAccumulator | None) -> int:
+def _compute_cost_usd(provider_cls, model: str, usage: UsageAccumulator | None) -> float:
     if provider_cls is None or usage is None:
-        return 0
+        return 0.0
     pricing = provider_cls.PRICING.get(model)
     if not pricing:
         # Real, successful, token-consuming usage with nowhere to price it —
@@ -270,14 +270,25 @@ def _compute_cost_credits(provider_cls, model: str, usage: UsageAccumulator | No
             "No pricing entry for %s/%s — %s input / %s output tokens billed as free",
             provider_cls.__name__, model, usage.input_tokens, usage.output_tokens,
         )
-        return 0
-    cost_usd = (
+        return 0.0
+    return (
         usage.input_tokens / 1_000_000 * pricing["input"]
         + usage.output_tokens / 1_000_000 * pricing["output"]
     )
+
+
+def _compute_cost_credits(provider_cls, model: str, usage: UsageAccumulator | None) -> int:
+    cost_usd = _compute_cost_usd(provider_cls, model, usage)
     if cost_usd <= 0:
         return 0
     return max(1, math.ceil(cost_usd / CREDIT_VALUE_USD))
+
+
+def compute_turn_cost_usd(ai_provider: str, model: str, usage: UsageAccumulator | None) -> float:
+    """Real USD cost for a turn, independent of credit-unit rounding —
+    used to track BYOK spend, which isn't deducted from credits at all
+    (see chat_messages.services._record_turn)."""
+    return _compute_cost_usd(PROVIDERS.get(ai_provider), model, usage)
 
 
 def _apply_credit_deduction(user, cost: int) -> None:

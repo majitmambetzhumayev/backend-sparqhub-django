@@ -78,6 +78,30 @@ class SendMessageServiceTest(TransactionTestCase):
 
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.services.send_chat_message", new_callable=AsyncMock)
+    def test_computes_real_cost_when_personal_key_used(self, mock_send, mock_extract_task, mock_title_task):
+        # Thread defaults to anthropic/claude-sonnet-5 ($3/$15 per 1M
+        # tokens): 100 input + 50 output => 0.0003 + 0.00075 = 0.00105.
+        mock_send.return_value = ("Hi there!", UsageAccumulator(input_tokens=100, output_tokens=50), False)
+
+        run(send_message(self.thread, "Hello", self.user))
+
+        assistant_message = Message.objects.get(thread=self.thread, sender="assistant")
+        self.assertAlmostEqual(float(assistant_message.estimated_cost_usd), 0.00105)
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.services.send_chat_message", new_callable=AsyncMock)
+    def test_does_not_compute_cost_when_global_key_used(self, mock_send, mock_extract_task, mock_title_task):
+        mock_send.return_value = ("Hi there!", UsageAccumulator(input_tokens=100, output_tokens=50), True)
+
+        run(send_message(self.thread, "Hello", self.user))
+
+        assistant_message = Message.objects.get(thread=self.thread, sender="assistant")
+        self.assertEqual(float(assistant_message.estimated_cost_usd), 0.0)
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.services.send_chat_message")
     def test_records_tool_calls_used_during_the_turn(self, mock_send, mock_extract_task, mock_title_task):
         async def fake_send_chat_message(*args, **kwargs):
@@ -252,7 +276,10 @@ class GetUsageSummaryTest(TransactionTestCase):
         self.thread = Thread.objects.create(user=self.user, assistant=self.assistant, conversation_state=[])
 
     def test_returns_zero_for_a_user_with_no_messages(self):
-        self.assertEqual(get_usage_summary(self.user), {"input_tokens": 0, "output_tokens": 0})
+        self.assertEqual(
+            get_usage_summary(self.user),
+            {"input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": 0.0},
+        )
 
     def test_sums_assistant_messages_only_across_threads(self):
         other_thread = Thread.objects.create(user=self.user, assistant=self.assistant, conversation_state=[])
@@ -266,7 +293,10 @@ class GetUsageSummaryTest(TransactionTestCase):
             thread=other_thread, sender="assistant", content="Hi again", input_tokens=20, output_tokens=10,
         )
 
-        self.assertEqual(get_usage_summary(self.user), {"input_tokens": 120, "output_tokens": 60})
+        self.assertEqual(
+            get_usage_summary(self.user),
+            {"input_tokens": 120, "output_tokens": 60, "estimated_cost_usd": 0.0},
+        )
 
     def test_excludes_other_users_messages(self):
         other_user = User.objects.create_user(username="otherusageuser", password="pass")
@@ -276,7 +306,24 @@ class GetUsageSummaryTest(TransactionTestCase):
             thread=other_thread, sender="assistant", content="Hi", input_tokens=500, output_tokens=500,
         )
 
-        self.assertEqual(get_usage_summary(self.user), {"input_tokens": 0, "output_tokens": 0})
+        self.assertEqual(
+            get_usage_summary(self.user),
+            {"input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": 0.0},
+        )
+
+    def test_sums_estimated_cost_usd_for_byok_turns(self):
+        Message.objects.create(
+            thread=self.thread, sender="assistant", content="Hi",
+            input_tokens=100, output_tokens=50, estimated_cost_usd="0.001234",
+        )
+        Message.objects.create(
+            thread=self.thread, sender="assistant", content="Hi again",
+            input_tokens=20, output_tokens=10, estimated_cost_usd="0.000766",
+        )
+
+        summary = get_usage_summary(self.user)
+
+        self.assertAlmostEqual(summary["estimated_cost_usd"], 0.002)
 
 
 class ConversationConsumerTest(TransactionTestCase):
@@ -1237,16 +1284,17 @@ class UsageSummaryAPITest(APITestCase):
         response = self.client.get(reverse('usage-summary'))
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data, {"input_tokens": 0, "output_tokens": 0})
+        self.assertEqual(response.data, {"input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": 0.0})
 
     def test_returns_summed_totals(self):
         Message.objects.create(
-            thread=self.thread, sender="assistant", content="Hi", input_tokens=100, output_tokens=50,
+            thread=self.thread, sender="assistant", content="Hi",
+            input_tokens=100, output_tokens=50, estimated_cost_usd="0.05",
         )
 
         response = self.client.get(reverse('usage-summary'))
 
-        self.assertEqual(response.data, {"input_tokens": 100, "output_tokens": 50})
+        self.assertEqual(response.data, {"input_tokens": 100, "output_tokens": 50, "estimated_cost_usd": 0.05})
 
     def test_requires_authentication(self):
         self.client.force_authenticate(user=None)
