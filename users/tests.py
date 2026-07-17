@@ -8,6 +8,7 @@ from django.core.cache import cache
 from django.contrib.auth.tokens import default_token_generator
 from django.http import HttpResponseRedirect
 
+from users.serializers import CurrentUserSerializer
 from users.services import email_confirmation_token_generator, get_or_create_oauth_user
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
@@ -565,3 +566,58 @@ class OAuthCallbackViewTest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_302_FOUND)
         self.assertIn('oauth_no_email', response.url)
         self.assertFalse(User.objects.filter(google_id='g-no-email').exists())
+
+
+class MarkOnboardingSeenTest(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='onboarduser', password='pass', email_verified=True)
+        self.client.force_authenticate(user=self.user)
+
+    def test_marks_onboarding_seen(self):
+        self.assertFalse(self.user.has_seen_onboarding)
+
+        response = self.client.post(reverse('onboarding-seen'))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.has_seen_onboarding)
+
+    def test_requires_authentication(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.post(reverse('onboarding-seen'))
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_requires_csrf_token_when_enforced(self):
+        client = APIClient(enforce_csrf_checks=True)
+        client.force_authenticate(user=self.user)
+
+        response = client.post(reverse('onboarding-seen'))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class CurrentUserOnboardingFieldTest(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='meuser', password='pass', email_verified=True)
+        self.client.force_authenticate(user=self.user)
+
+    def test_me_endpoint_exposes_has_seen_onboarding(self):
+        response = self.client.get(reverse('auth-me'))
+
+        self.assertEqual(response.data['user']['has_seen_onboarding'], False)
+
+    def test_field_is_read_only_via_me_endpoint(self):
+        # CurrentUserAPIView is GET-only, but this documents the intent
+        # explicitly: has_seen_onboarding must only ever flip via
+        # MarkOnboardingSeenAPIView, never as a side effect of some other
+        # user-update path being added later.
+        self.assertIn('has_seen_onboarding', CurrentUserSerializer(self.user).data)
+        serializer = CurrentUserSerializer(self.user, data={'has_seen_onboarding': True}, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.has_seen_onboarding)

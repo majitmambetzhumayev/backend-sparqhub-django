@@ -52,8 +52,9 @@ class CurrentUserSerializer(serializers.ModelSerializer):
             'phone_number',
             'credits_remaining',
             'is_staff',
+            'has_seen_onboarding',
         ]
-        read_only_fields = ['email']
+        read_only_fields = ['email', 'has_seen_onboarding']
 
 
 class AdminUserSerializer(serializers.ModelSerializer):

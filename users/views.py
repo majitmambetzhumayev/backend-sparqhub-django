@@ -222,6 +222,16 @@ class CurrentUserAPIView(APIView):
         return Response({'user': serializer.data})
 
 
+@method_decorator(csrf_protect, name='dispatch')
+class MarkOnboardingSeenAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        request.user.has_seen_onboarding = True
+        request.user.save(update_fields=['has_seen_onboarding'])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class AdminUserViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
