@@ -56,6 +56,11 @@ class CustomUser(AbstractUser):
     )
     phone_number = models.CharField(max_length=20, blank=True, null=True)
     credits_remaining = models.IntegerField(default=100)
+    # Gates the first-login onboarding tour on the frontend — flipped to
+    # True once the user has seen (or dismissed) it, so it never shows
+    # again. Server-side rather than localStorage so it survives a
+    # different browser/device, not just cosmetic per-session state.
+    has_seen_onboarding = models.BooleanField(default=False)
 
     # Override the built-in m2m fields:
     groups = models.ManyToManyField(
