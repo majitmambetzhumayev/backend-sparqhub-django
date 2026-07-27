@@ -91,6 +91,7 @@ INSTALLED_APPS = [
     'librarian',
     'project_files',
     'changelog',
+    'prompts',
     'keys',
     'mcp_server',
     'mcp_client',
