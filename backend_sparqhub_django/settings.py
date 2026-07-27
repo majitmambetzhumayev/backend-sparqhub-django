@@ -80,6 +80,7 @@ INSTALLED_APPS = [
     'chat_messages',
     'librarian',
     'project_files',
+    'changelog',
     'keys',
     'mcp_server',
     'mcp_client',
