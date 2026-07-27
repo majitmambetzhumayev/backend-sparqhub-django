@@ -7,6 +7,7 @@ from asgiref.sync import sync_to_async
 from ai_providers.agent_loop import run_agent_loop
 from ai_providers.base import UsageAccumulator
 from ai_providers.factory import get_provider, PROVIDERS
+from ai_providers.observability import llm_call_span, record_llm_usage
 
 logger = logging.getLogger(__name__)
 
@@ -312,16 +313,33 @@ async def deduct_credits(user, ai_provider: str, model: str, usage: UsageAccumul
         await sync_to_async(_apply_credit_deduction)(user, cost)
 
 
-async def _stream_and_release(provider, chunks):
+async def _stream_and_release(provider, chunks, model: str, usage: UsageAccumulator):
     """Wraps a provider's stream so aclose() runs once the caller has fully
     drained it (or aborted early) — the provider has to stay open until then,
     unlike the non-streaming path where send_chat_message can close it itself
-    before returning."""
-    try:
-        async for chunk in chunks:
-            yield chunk
-    finally:
-        await provider.aclose()
+    before returning.
+
+    Also the one place that spans a streaming turn's *initial* model call --
+    unlike the non-streaming path, this never goes through run_agent_loop
+    (each provider's own stream() only calls run_agent_loop for a
+    tool-triggered continuation, see e.g. AnthropicProvider.stream). Any
+    such continuation's own spans nest under this one, since it's still
+    "current" for the whole duration of iteration. Usage is read once at
+    the end, so on a tool-heavy turn this span's token counts are the
+    turn's total, not just the initial call's slice -- a known
+    simplification, not a bug: splitting them would need each provider's
+    stream() to report its own first-call usage separately, which none do.
+    """
+    with llm_call_span(provider.label.lower(), model) as span:
+        try:
+            async for chunk in chunks:
+                yield chunk
+        finally:
+            record_llm_usage(
+                span, response_model=model,
+                input_tokens=usage.input_tokens or None, output_tokens=usage.output_tokens or None,
+            )
+            await provider.aclose()
 
 
 async def send_chat_message(
@@ -401,7 +419,7 @@ async def send_chat_message(
                 chunks = provider.stream(turn, messages, system, tools, tool_executor, usage=usage, on_tool_call=on_tool_call)
                 # _stream_and_release takes over closing the provider once the
                 # caller drains it — it must stay open until then.
-                result = _stream_and_release(provider, chunks)
+                result = _stream_and_release(provider, chunks, model, usage)
                 provider_handed_off = True
             else:
                 result = await run_agent_loop(

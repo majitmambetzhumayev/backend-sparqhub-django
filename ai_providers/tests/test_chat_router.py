@@ -33,7 +33,12 @@ def run(coro):
 
 def _mock_provider(**kwargs) -> MagicMock:
     """A MagicMock provider with an awaitable aclose() — send_chat_message
-    always calls it, and a plain MagicMock's aclose() isn't awaitable."""
+    always calls it, and a plain MagicMock's aclose() isn't awaitable.
+    label defaults to a real string since chat_router.py reads it (via
+    .lower()) for the gen_ai.provider.name span attribute, which OTel
+    validates as a str/int/float/bool -- override via kwargs if a test
+    needs a specific provider name."""
+    kwargs.setdefault('label', 'Anthropic')
     provider = MagicMock(**kwargs)
     provider.aclose = AsyncMock()
     return provider
