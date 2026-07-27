@@ -2,11 +2,19 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from django.contrib.auth import get_user_model
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 from ai_providers.base import ProviderResponse
-from librarian.services import _embed, _get_embed_client, extract_and_store_memories, retrieve_relevant_memories, store_memory
+from librarian.services import (
+    _EXTRACTION_PROMPT_NAME,
+    _embed,
+    _get_embed_client,
+    extract_and_store_memories,
+    retrieve_relevant_memories,
+    store_memory,
+)
 from librarian.tasks import extract_memories_task
+from prompts.models import PromptTemplate
 
 User = get_user_model()
 
@@ -66,7 +74,21 @@ class EmbedTest(TestCase):
         self.assertEqual(results, ["close match"])
 
 
-class ExtractAndStoreMemoriesTest(SimpleTestCase):
+class ExtractAndStoreMemoriesTest(TransactionTestCase):
+    # TransactionTestCase (not TestCase) because extract_and_store_memories
+    # reads the active prompt via sync_to_async, which runs on a separate
+    # thread with its own DB connection -- that connection can't see a row
+    # created inside TestCase's per-test atomic block, only a committed one.
+    def setUp(self):
+        # version=2, not 1 -- the seed migration already created version 1
+        # for this name (see prompts/migrations/0002_seed_memory_extraction_prompt.py),
+        # and TransactionTestCase doesn't wrap tests in a rolled-back
+        # transaction, so that row is still there. save()'s single-active
+        # invariant deactivates it in favor of this one.
+        PromptTemplate.objects.create(
+            name=_EXTRACTION_PROMPT_NAME, version=2, content="test system prompt", is_active=True,
+        )
+
     @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
     @patch('librarian.services.store_memory')
     @patch('ai_providers.factory.get_provider')

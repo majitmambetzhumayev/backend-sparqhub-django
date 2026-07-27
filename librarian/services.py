@@ -3,15 +3,11 @@ from pgvector.django import CosineDistance
 
 from ai_providers.factory import provider_session
 from core.embeddings import embed as _embed, get_embed_client as _get_embed_client
+from prompts.services import get_active_prompt
 
 from .models import MemoryEntry
 
-_EXTRACTION_SYSTEM_PROMPT = (
-    "Given one exchange between a user and an assistant, decide whether it contains any "
-    "durable fact worth remembering about the user long-term (preferences, personal details, "
-    "ongoing projects, decisions). Reply with one fact per line, each rewritten as a short "
-    "standalone statement. If there is nothing worth remembering, reply with exactly NONE."
-)
+_EXTRACTION_PROMPT_NAME = 'memory_extraction_system'
 
 # Fixed to one provider/model regardless of a thread's chosen chat provider —
 # every user's memories must land in the same vector space to be comparable
@@ -43,8 +39,9 @@ async def extract_and_store_memories(user, assistant, user_text: str, assistant_
     key_record = await get_user_api_key(user, assistant.ai_provider)
     api_key = key_record.encrypted_key if key_record else None
     messages = [{"role": "user", "content": f"User: {user_text}\nAssistant: {assistant_text}"}]
+    system_prompt = await sync_to_async(get_active_prompt)(_EXTRACTION_PROMPT_NAME)
     async with provider_session(assistant.ai_provider, api_key=api_key) as provider:
-        response = await provider.complete(assistant, messages, _EXTRACTION_SYSTEM_PROMPT, None)
+        response = await provider.complete(assistant, messages, system_prompt, None)
     for line in response.text.splitlines():
         fact = line.strip()
         if fact and fact.upper() != "NONE":
