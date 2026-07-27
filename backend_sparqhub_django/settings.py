@@ -35,6 +35,16 @@ if SENTRY_DSN:
         profile_lifecycle="trace",
     )
 
+# Agent/LLM-call tracing (OpenTelemetry GenAI semantic conventions), separate
+# from Sentry above -- Sentry covers unhandled errors, this covers the
+# reasoning-chain structure of a turn (which model/tool ran, in what order,
+# how many tokens). Blank (e.g. no collector stood up yet) means spans are
+# still generated and printed to the console -- useful locally without
+# requiring new infra just to see them -- but nothing leaves the process.
+OTEL_EXPORTER_OTLP_ENDPOINT = config('OTEL_EXPORTER_OTLP_ENDPOINT', default='')
+from ai_providers.observability import configure_tracing  # noqa: E402
+configure_tracing(OTEL_EXPORTER_OTLP_ENDPOINT, service_name='sparqhub-backend')
+
 # Used to build absolute URLs for generated media (e.g. AI-generated images)
 # from contexts with no HTTP request object, like the WebSocket consumer.
 # .strip() guards against a stray trailing newline/space from a pasted

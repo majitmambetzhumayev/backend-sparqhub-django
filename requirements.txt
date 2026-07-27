@@ -15,6 +15,13 @@ httpx
 mcp>=1.2.0
 mistralai
 openai
+# Pinned (unlike the rest of this file) -- an unpinned install resolves
+# opentelemetry-semantic-conventions to a version newer than mistralai's own
+# pin (<0.61,>=0.60b1), breaking `pip check`. 1.39.1 is the last release
+# pair that stays inside that range.
+opentelemetry-api==1.39.1
+opentelemetry-sdk==1.39.1
+opentelemetry-exporter-otlp-proto-http==1.39.1
 pgvector
 Pillow
 psycopg2-binary

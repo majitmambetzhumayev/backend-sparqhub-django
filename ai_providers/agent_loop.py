@@ -1,6 +1,7 @@
 import logging
 
 from ai_providers.base import warn_if_finish_reason_suspicious
+from ai_providers.observability import llm_call_span, record_llm_usage, tool_call_span
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +30,20 @@ async def run_agent_loop(
     name right before it executes — lets callers (e.g. the WS consumer)
     surface "using tool X" status to the user during an otherwise-silent gap.
     """
+    provider_name = provider.label.lower()
+
     if initial_response is not None:
         response = initial_response
     else:
-        response = await provider.complete(assistant, messages, system, tools)
-        if usage is not None and response.usage:
-            usage.add(**response.usage)
+        with llm_call_span(provider_name, assistant.model) as span:
+            response = await provider.complete(assistant, messages, system, tools)
+            if response.usage:
+                record_llm_usage(
+                    span, response_model=assistant.model,
+                    input_tokens=response.usage.get("input_tokens"), output_tokens=response.usage.get("output_tokens"),
+                )
+                if usage is not None:
+                    usage.add(**response.usage)
     iterations = 0
     while response.requires_tool_execution and tool_executor:
         iterations += 1
@@ -45,10 +54,17 @@ async def run_agent_loop(
         for call in response.tool_calls:
             if on_tool_call is not None:
                 await on_tool_call(call.name)
-            results.append((call.id, await tool_executor(call.name, call.arguments)))
+            with tool_call_span(call.name):
+                results.append((call.id, await tool_executor(call.name, call.arguments)))
         messages = provider.append_turn(messages, response, tool_results=results)
-        response = await provider.complete(assistant, messages, system, tools)
-        if usage is not None and response.usage:
-            usage.add(**response.usage)
+        with llm_call_span(provider_name, assistant.model) as span:
+            response = await provider.complete(assistant, messages, system, tools)
+            if response.usage:
+                record_llm_usage(
+                    span, response_model=assistant.model,
+                    input_tokens=response.usage.get("input_tokens"), output_tokens=response.usage.get("output_tokens"),
+                )
+                if usage is not None:
+                    usage.add(**response.usage)
     warn_if_finish_reason_suspicious(response)
     return response.text
