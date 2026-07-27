@@ -38,6 +38,9 @@ from mcp_client.views import MCPServerViewSet
 # Project files viewset
 from project_files.views import ProjectFileViewSet
 
+# Changelog
+from changelog.views import ChangelogListAPIView
+
 # Threading and messaging
 # chat_messages/urls.py defines:
 #   path('threads/<int:thread_id>/messages/', SendMessageAPIView.as_view(), name='message-list')
@@ -69,6 +72,11 @@ urlpatterns += [
 urlpatterns += [
     path('api/threads/', ThreadListAPIView.as_view(), name='thread-list'),
     path('api/threads/<int:pk>/', ThreadDetailAPIView.as_view(), name='thread-detail'),
+]
+
+# Changelog (public, backs the landing page's patch-notes section)
+urlpatterns += [
+    path('api/changelog/', ChangelogListAPIView.as_view(), name='changelog-list'),
 ]
 
 # Main API router for viewsets
