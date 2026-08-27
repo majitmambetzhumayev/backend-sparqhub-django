@@ -19,6 +19,7 @@ class MCPServerSerializer(serializers.ModelSerializer):
             'command',
             'args',
             'enabled',
+            'requires_confirmation',
         ]
 
     def __init__(self, *args, **kwargs):

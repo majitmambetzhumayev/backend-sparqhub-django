@@ -8,7 +8,9 @@ from ai_providers.anthropic.anthropic_provider import AnthropicProvider
 from ai_providers.base import UsageAccumulator
 from ai_providers.factory import PROVIDERS
 from ai_providers.chat_router import (
+    AgentTool,
     InsufficientCreditsError,
+    _build_combined_executor,
     _build_delegate_tool,
     _build_file_search_tool,
     _build_image_tool,
@@ -143,52 +145,61 @@ class SendChatMessageCreditsGateTest(TransactionTestCase):
 
 
 class GetMcpContextTest(TransactionTestCase):
+    """Confirmation is no longer tested here — _get_mcp_context only builds
+    AgentTool entries with the right requires_confirmation flag; the gate
+    itself is applied uniformly by _build_combined_executor (see
+    BuildCombinedExecutorTest)."""
+
     def setUp(self):
         self.user = User.objects.create_user(username='mcpctxuser', password='pass')
         self.project = Project.objects.create(user=self.user, name='Research')
 
     def test_returns_empty_when_no_project(self):
-        tools, tool_executor = run(_get_mcp_context(None))
-        self.assertEqual(tools, [])
-        self.assertIsNone(tool_executor)
+        self.assertEqual(run(_get_mcp_context(None)), {})
 
     def test_returns_empty_when_project_has_no_servers(self):
-        tools, tool_executor = run(_get_mcp_context(self.project.id))
-        self.assertEqual(tools, [])
-        self.assertIsNone(tool_executor)
+        self.assertEqual(run(_get_mcp_context(self.project.id)), {})
 
     def test_ignores_disabled_servers(self):
         MCPServer.objects.create(
             project=self.project, name='Disabled', transport='stdio', command='python', enabled=False,
         )
-        tools, tool_executor = run(_get_mcp_context(self.project.id))
-        self.assertEqual(tools, [])
-        self.assertIsNone(tool_executor)
+        self.assertEqual(run(_get_mcp_context(self.project.id)), {})
 
     def test_ignores_servers_from_other_projects(self):
         other_project = Project.objects.create(user=self.user, name='Other')
         MCPServer.objects.create(project=other_project, name='NotMine', transport='stdio', command='python')
-        tools, tool_executor = run(_get_mcp_context(self.project.id))
-        self.assertEqual(tools, [])
-        self.assertIsNone(tool_executor)
+        self.assertEqual(run(_get_mcp_context(self.project.id)), {})
 
     @patch('mcp_client.services.get_tools_from_server', new_callable=AsyncMock)
     @patch('mcp_client.services.call_tool', new_callable=AsyncMock, return_value='tool output')
     def test_collects_tools_from_enabled_servers_and_executes(self, mock_call_tool, mock_get_tools):
+        MCPServer.objects.create(
+            project=self.project, name='Mine', transport='stdio', command='python', requires_confirmation=False,
+        )
+        mock_get_tools.return_value = [{'name': 'search', 'description': '', 'input_schema': {}}]
+
+        registry = run(_get_mcp_context(self.project.id))
+
+        self.assertEqual(list(registry), ['search'])
+        self.assertEqual(registry['search'].schema, {'name': 'search', 'description': '', 'input_schema': {}})
+        self.assertFalse(registry['search'].requires_confirmation)
+        self.assertEqual(run(registry['search'].executor({})), 'tool output')
+
+    @patch('mcp_client.services.get_tools_from_server', new_callable=AsyncMock)
+    @patch('mcp_client.services.call_tool', new_callable=AsyncMock, return_value='tool output')
+    def test_defaults_to_requiring_confirmation(self, mock_call_tool, mock_get_tools):
         MCPServer.objects.create(project=self.project, name='Mine', transport='stdio', command='python')
         mock_get_tools.return_value = [{'name': 'search', 'description': '', 'input_schema': {}}]
 
-        tools, tool_executor = run(_get_mcp_context(self.project.id))
+        registry = run(_get_mcp_context(self.project.id))
 
-        self.assertEqual(tools, [{'name': 'search', 'description': '', 'input_schema': {}}])
-        self.assertEqual(run(tool_executor('search', {})), 'tool output')
+        self.assertTrue(registry['search'].requires_confirmation)
 
     @patch('mcp_client.services.get_tools_from_server', new_callable=AsyncMock, side_effect=ValueError('unreachable'))
     def test_survives_unreachable_server(self, mock_get_tools):
         MCPServer.objects.create(project=self.project, name='Down', transport='sse', url='https://example.com/mcp')
-        tools, tool_executor = run(_get_mcp_context(self.project.id))
-        self.assertEqual(tools, [])
-        self.assertIsNone(tool_executor)
+        self.assertEqual(run(_get_mcp_context(self.project.id)), {})
 
     @patch('mcp_client.services.get_tools_from_server')
     @patch('mcp_client.services.call_tool', new_callable=AsyncMock, return_value='from first server')
@@ -197,19 +208,97 @@ class GetMcpContextTest(TransactionTestCase):
         # entries while the dispatch map only kept the last server, so the
         # list and the actual routing disagreed. Now both consistently
         # resolve to the first server that exposed the name.
-        first = MCPServer.objects.create(project=self.project, name='First', transport='stdio', command='python')
-        second = MCPServer.objects.create(project=self.project, name='Second', transport='stdio', command='python')
+        first = MCPServer.objects.create(
+            project=self.project, name='First', transport='stdio', command='python', requires_confirmation=False,
+        )
+        second = MCPServer.objects.create(
+            project=self.project, name='Second', transport='stdio', command='python', requires_confirmation=False,
+        )
 
         async def fake_get_tools(server):
             return [{'name': 'search', 'description': '', 'input_schema': {}}]
 
         mock_get_tools.side_effect = fake_get_tools
 
-        tools, tool_executor = run(_get_mcp_context(self.project.id))
+        registry = run(_get_mcp_context(self.project.id))
 
-        self.assertEqual([t['name'] for t in tools], ['search'])
-        self.assertEqual(run(tool_executor('search', {})), 'from first server')
+        self.assertEqual(list(registry), ['search'])
+        self.assertEqual(run(registry['search'].executor({})), 'from first server')
         mock_call_tool.assert_awaited_once_with(first, 'search', {})
+
+
+class BuildCombinedExecutorTest(TransactionTestCase):
+    """_build_combined_executor is the one place any tool call — built-in or
+    MCP — gets dispatched and, if flagged, gated on human confirmation. This
+    exercises that gate generically, independent of any specific tool."""
+
+    def _tool(self, requires_confirmation=False, label=None, result='ok'):
+        executor = AsyncMock(return_value=result)
+        return executor, AgentTool(
+            schema={'name': 'thing'}, executor=executor,
+            requires_confirmation=requires_confirmation, confirmation_label=label,
+        )
+
+    def test_dispatches_to_the_matching_tool(self):
+        executor, tool = self._tool()
+        combined = _build_combined_executor({'thing': tool}, confirm_tool_call=None)
+
+        result = run(combined('thing', {'a': 1}))
+
+        self.assertEqual(result, 'ok')
+        executor.assert_awaited_once_with({'a': 1})
+
+    def test_unknown_tool_raises(self):
+        combined = _build_combined_executor({}, confirm_tool_call=None)
+        with self.assertRaises(ValueError):
+            run(combined('thing', {}))
+
+    def test_tool_not_requiring_confirmation_skips_the_gate_entirely(self):
+        executor, tool = self._tool(requires_confirmation=False)
+        combined = _build_combined_executor({'thing': tool}, confirm_tool_call=None)
+
+        # No confirm_tool_call at all, yet it still runs — the gate only
+        # applies when the tool itself opts in.
+        result = run(combined('thing', {}))
+        self.assertEqual(result, 'ok')
+
+    def test_sensitive_tool_fails_closed_with_no_confirm_callback(self):
+        executor, tool = self._tool(requires_confirmation=True)
+        combined = _build_combined_executor({'thing': tool}, confirm_tool_call=None)
+
+        result = run(combined('thing', {}))
+
+        self.assertIn('requires interactive user confirmation', result)
+        executor.assert_not_awaited()
+
+    def test_sensitive_tool_declined(self):
+        executor, tool = self._tool(requires_confirmation=True)
+        confirm_tool_call = AsyncMock(return_value=False)
+        combined = _build_combined_executor({'thing': tool}, confirm_tool_call)
+
+        result = run(combined('thing', {'q': 'x'}))
+
+        self.assertIn('declined', result)
+        confirm_tool_call.assert_awaited_once_with('thing', {'q': 'x'})
+        executor.assert_not_awaited()
+
+    def test_sensitive_tool_confirmed(self):
+        executor, tool = self._tool(requires_confirmation=True)
+        confirm_tool_call = AsyncMock(return_value=True)
+        combined = _build_combined_executor({'thing': tool}, confirm_tool_call)
+
+        result = run(combined('thing', {}))
+
+        self.assertEqual(result, 'ok')
+        executor.assert_awaited_once()
+
+    def test_uses_custom_confirmation_label(self):
+        executor, tool = self._tool(requires_confirmation=True, label='this special thing')
+        combined = _build_combined_executor({'thing': tool}, confirm_tool_call=None)
+
+        result = run(combined('thing', {}))
+
+        self.assertIn('this special thing', result)
 
 
 class BuildFileSearchToolTest(TransactionTestCase):
@@ -218,14 +307,10 @@ class BuildFileSearchToolTest(TransactionTestCase):
         self.project = Project.objects.create(user=self.user, name='Research')
 
     def test_returns_none_when_no_project(self):
-        tool, executor = run(_build_file_search_tool(None))
-        self.assertIsNone(tool)
-        self.assertIsNone(executor)
+        self.assertIsNone(run(_build_file_search_tool(None)))
 
     def test_returns_none_when_project_has_no_searchable_chunks(self):
-        tool, executor = run(_build_file_search_tool(self.project.id))
-        self.assertIsNone(tool)
-        self.assertIsNone(executor)
+        self.assertIsNone(run(_build_file_search_tool(self.project.id)))
 
     def test_returns_tool_and_working_executor_when_chunks_exist(self):
         file_obj = ProjectFile.objects.create(
@@ -236,11 +321,12 @@ class BuildFileSearchToolTest(TransactionTestCase):
             file=file_obj, project=self.project, chunk_index=0, content='relevant passage', embedding=[0.0] * 1024,
         )
 
-        tool, executor = run(_build_file_search_tool(self.project.id))
+        tool = run(_build_file_search_tool(self.project.id))
 
-        self.assertEqual(tool['name'], 'search_project_files')
+        self.assertEqual(tool.schema['name'], 'search_project_files')
+        self.assertFalse(tool.requires_confirmation)
         with patch('project_files.services.embed', return_value=[0.0] * 1024):
-            result = run(executor({'query': 'anything'}))
+            result = run(tool.executor({'query': 'anything'}))
         self.assertIn('relevant passage', result)
         self.assertIn('notes.txt', result)
 
@@ -253,8 +339,8 @@ class BuildFileSearchToolTest(TransactionTestCase):
             file=file_obj, project=self.project, chunk_index=0, content='relevant passage', embedding=[0.0] * 1024,
         )
         with patch('project_files.services.search_project_files', return_value=[]):
-            tool, executor = run(_build_file_search_tool(self.project.id))
-            result = run(executor({'query': 'anything'}))
+            tool = run(_build_file_search_tool(self.project.id))
+            result = run(tool.executor({'query': 'anything'}))
         self.assertIn('No relevant content', result)
 
 
@@ -263,9 +349,7 @@ class BuildImageToolTest(TransactionTestCase):
         self.user = User.objects.create_user(username='imageuser', password='pass', credits_remaining=100)
 
     def test_returns_none_for_provider_without_image_support(self):
-        tool, executor = _build_image_tool('anthropic', None, self.user, True, UsageAccumulator())
-        self.assertIsNone(tool)
-        self.assertIsNone(executor)
+        self.assertIsNone(_build_image_tool('anthropic', None, self.user, True, UsageAccumulator()))
 
     @patch('image_providers.services.save_generated_image', return_value='http://localhost:8000/media/generated_images/x.png')
     @patch('image_providers.factory.get_image_provider')
@@ -276,10 +360,11 @@ class BuildImageToolTest(TransactionTestCase):
         ))
         mock_get_provider.return_value = provider
 
-        tool, executor = _build_image_tool('openai', None, self.user, False, UsageAccumulator())
+        tool = _build_image_tool('openai', None, self.user, False, UsageAccumulator())
 
-        self.assertEqual(tool['name'], 'generate_image')
-        result = run(executor({'prompt': 'a cat'}))
+        self.assertEqual(tool.schema['name'], 'generate_image')
+        self.assertFalse(tool.requires_confirmation)
+        result = run(tool.executor({'prompt': 'a cat'}))
         self.assertEqual(result, '![Generated image](http://localhost:8000/media/generated_images/x.png)')
         provider.generate.assert_called_once_with('a cat')
 
@@ -297,8 +382,8 @@ class BuildImageToolTest(TransactionTestCase):
         mock_get_provider.return_value = provider
 
         usage = UsageAccumulator()
-        _, executor = _build_image_tool('openai', None, self.user, True, usage)
-        run(executor({'prompt': 'a cat'}))
+        tool = _build_image_tool('openai', None, self.user, True, usage)
+        run(tool.executor({'prompt': 'a cat'}))
 
         self.user.refresh_from_db()
         # gpt-image-2: $8/$30 per 1M tokens. 1M input + 1M output = $38 = 3800 credits at $0.01/credit.
@@ -315,8 +400,8 @@ class BuildImageToolTest(TransactionTestCase):
         mock_get_provider.return_value = provider
 
         usage = UsageAccumulator()
-        _, executor = _build_image_tool('openai', 'sk-personal', self.user, False, usage)
-        run(executor({'prompt': 'a cat'}))
+        tool = _build_image_tool('openai', 'sk-personal', self.user, False, usage)
+        run(tool.executor({'prompt': 'a cat'}))
 
         self.assertEqual(usage.extra_credits, 0)
         self.user.refresh_from_db()
@@ -434,29 +519,26 @@ class SendChatMessageFileSearchToolTest(TransactionTestCase):
 
 
 class BuildDelegateToolTest(TransactionTestCase):
+    """Confirmation is no longer part of the delegate tool's own executor —
+    it's applied uniformly by _build_combined_executor (see
+    BuildCombinedExecutorTest), based on requires_confirmation/
+    confirmation_label below. Every test here calls .executor directly,
+    i.e. as if already confirmed."""
+
     def setUp(self):
         self.user = User.objects.create_user(username='delegateuser', password='pass', credits_remaining=100)
 
-    def test_declines_without_confirmation(self):
-        confirm_tool_call = AsyncMock(return_value=False)
-        _, executor = _build_delegate_tool(self.user, confirm_tool_call)
-
-        result = run(executor({
-            'provider': 'gemini', 'model': 'gemini-2.5-flash-image', 'prompt': 'a cat', 'reason': 'no image support',
-        }))
-
-        self.assertIn('declined', result)
-        confirm_tool_call.assert_awaited_once_with('delegate_to_model', {
-            'provider': 'gemini', 'model': 'gemini-2.5-flash-image', 'prompt': 'a cat', 'reason': 'no image support',
-        })
+    def test_requires_confirmation_with_a_natural_label(self):
+        tool = _build_delegate_tool(self.user)
+        self.assertTrue(tool.requires_confirmation)
+        self.assertEqual(tool.confirmation_label, 'this delegation')
 
     @patch('ai_providers.chat_router.send_chat_message', new_callable=AsyncMock)
-    def test_proceeds_and_dispatches_when_confirmed(self, mock_send):
+    def test_dispatches_to_the_target_provider(self, mock_send):
         mock_send.return_value = ('Here is your image: ![x](http://x)', UsageAccumulator(), False)
-        confirm_tool_call = AsyncMock(return_value=True)
-        _, executor = _build_delegate_tool(self.user, confirm_tool_call)
+        tool = _build_delegate_tool(self.user)
 
-        result = run(executor({
+        result = run(tool.executor({
             'provider': 'gemini', 'model': 'gemini-2.5-flash', 'prompt': 'a cat', 'reason': 'no image support',
         }))
 
@@ -474,9 +556,9 @@ class BuildDelegateToolTest(TransactionTestCase):
         # id (as actually happened: "gpt-image-1", which chat completions rejects).
         # That must not be trusted as-is; it should fall back to a real default.
         mock_send.return_value = ('OK', UsageAccumulator(), False)
-        _, executor = _build_delegate_tool(self.user, AsyncMock(return_value=True))
+        tool = _build_delegate_tool(self.user)
 
-        run(executor({'provider': 'openai', 'model': 'gpt-image-1', 'prompt': 'a cat', 'reason': 'x'}))
+        run(tool.executor({'provider': 'openai', 'model': 'gpt-image-1', 'prompt': 'a cat', 'reason': 'x'}))
 
         call_kwargs = mock_send.call_args.kwargs
         self.assertNotEqual(call_kwargs['model'], 'gpt-image-1')
@@ -485,32 +567,17 @@ class BuildDelegateToolTest(TransactionTestCase):
     @patch('ai_providers.chat_router.send_chat_message', new_callable=AsyncMock)
     def test_uses_default_model_when_none_requested(self, mock_send):
         mock_send.return_value = ('OK', UsageAccumulator(), False)
-        _, executor = _build_delegate_tool(self.user, AsyncMock(return_value=True))
+        tool = _build_delegate_tool(self.user)
 
-        run(executor({'provider': 'openai', 'prompt': 'a cat', 'reason': 'x'}))
+        run(tool.executor({'provider': 'openai', 'prompt': 'a cat', 'reason': 'x'}))
 
         call_kwargs = mock_send.call_args.kwargs
         self.assertEqual(call_kwargs['model'], PROVIDERS['openai'].AVAILABLE_MODELS[0]['id'])
 
-    def test_fails_closed_without_confirmation_hook(self):
-        # Security-critical: delegate_to_model's entire premise is "asks the
-        # user first". A caller with no confirmation channel (e.g. the plain
-        # HTTP send-message endpoint, which has no interactive round-trip)
-        # must not silently skip confirmation and dispatch anyway.
-        with patch('ai_providers.chat_router.send_chat_message', new_callable=AsyncMock) as mock_send:
-            _, executor = _build_delegate_tool(self.user, None)
-
-            result = run(executor({
-                'provider': 'gemini', 'model': 'gemini-2.5-flash', 'prompt': 'a cat', 'reason': 'x',
-            }))
-
-            self.assertIn('requires interactive user confirmation', result)
-            mock_send.assert_not_awaited()
-
     def test_unknown_provider_returns_error_text_without_dispatching(self):
-        _, executor = _build_delegate_tool(self.user, AsyncMock(return_value=True))
+        tool = _build_delegate_tool(self.user)
 
-        result = run(executor({'provider': 'not-a-provider', 'model': 'x', 'prompt': 'a cat', 'reason': 'x'}))
+        result = run(tool.executor({'provider': 'not-a-provider', 'model': 'x', 'prompt': 'a cat', 'reason': 'x'}))
 
         self.assertIn('Unknown provider', result)
 
@@ -518,9 +585,9 @@ class BuildDelegateToolTest(TransactionTestCase):
     def test_deducts_credits_when_delegated_call_used_global_key(self, mock_send):
         usage = UsageAccumulator(input_tokens=1_000_000, output_tokens=1_000_000)
         mock_send.return_value = ('OK', usage, True)
-        _, executor = _build_delegate_tool(self.user, AsyncMock(return_value=True))
+        tool = _build_delegate_tool(self.user)
 
-        run(executor({'provider': 'anthropic', 'model': 'claude-sonnet-5', 'prompt': 'hi', 'reason': 'x'}))
+        run(tool.executor({'provider': 'anthropic', 'model': 'claude-sonnet-5', 'prompt': 'hi', 'reason': 'x'}))
 
         self.user.refresh_from_db()
         # claude-sonnet-5: $3/$15 per 1M tokens = $18 = 1800 credits.
@@ -530,9 +597,9 @@ class BuildDelegateToolTest(TransactionTestCase):
     def test_does_not_deduct_credits_when_delegated_call_used_personal_key(self, mock_send):
         usage = UsageAccumulator(input_tokens=1_000_000, output_tokens=1_000_000)
         mock_send.return_value = ('OK', usage, False)
-        _, executor = _build_delegate_tool(self.user, AsyncMock(return_value=True))
+        tool = _build_delegate_tool(self.user)
 
-        run(executor({'provider': 'anthropic', 'model': 'claude-sonnet-5', 'prompt': 'hi', 'reason': 'x'}))
+        run(tool.executor({'provider': 'anthropic', 'model': 'claude-sonnet-5', 'prompt': 'hi', 'reason': 'x'}))
 
         self.user.refresh_from_db()
         self.assertEqual(self.user.credits_remaining, 100)
