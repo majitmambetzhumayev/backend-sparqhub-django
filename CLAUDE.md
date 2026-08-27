@@ -41,6 +41,43 @@ The same instinct applies elsewhere in the codebase: `image_providers/` for
 image generation, `mcp_client/` for external MCP tool servers — the pattern
 is "swap the connector, keep the business logic ignorant of which one."
 
+## Architecture: tool calls go through one uniform registry
+
+`ai_providers/chat_router.py` builds every tool the model can call for a
+turn — built-in (`generate_image`, `search_project_files`,
+`delegate_to_model`) or dynamically discovered from a project's MCP
+servers — as an `AgentTool` (schema + executor + `requires_confirmation` +
+optional `confirmation_label`), keyed by name in one `dict[str, AgentTool]`.
+`_build_combined_executor` is the single dispatch point: it looks the tool
+up, applies the confirmation gate (`_require_confirmation`) if that tool's
+`requires_confirmation` is set, then calls its executor.
+
+**Rule: adding a new tool means producing one `AgentTool` and putting it in
+the registry — never adding a branch to dispatch.** This exists because
+`_get_mcp_context` (MCP tools) and `_build_delegate_tool`
+(`delegate_to_model`) both need the exact same fail-closed
+human-confirmation behavior for a sensitive call; before this registry
+existed, each one re-implemented it, and MCP tools shipped with **no**
+confirmation gate at all for a while — a real gap (an MCP server can be
+configured with real privileges, e.g. SQL access, and `search_project_files`
+feeds attacker-controllable document text straight into the model's
+context, so an unconfirmed tool call is a live prompt-injection path, not a
+theoretical one).
+
+`MCPServer.requires_confirmation` (`mcp_client/models.py`) defaults to
+`True` — opt a specific server out only if its tools are genuinely
+read-only/low-risk.
+
+**Known gap, not yet started**: the confirmation pause itself
+(`chat_messages/generation_registry.py`) is a plain in-memory
+`asyncio.Future`, scoped to the single ASGI process — doesn't survive a
+restart. Planned fix is a DB-backed pending-confirmation record + a resume
+path, not a full graph/checkpointer rewrite (this codebase's agent loop is
+linear, not a branching workflow — see `ai_providers/agent_loop.py`).
+Multi-agent orchestration is a real direction for this product, but
+whether that eventually justifies adopting something like LangGraph is an
+explicit, deferred decision — don't assume either way.
+
 ## App map
 
 - `core/` — shared: embeddings, rate limiting, exceptions, middleware.

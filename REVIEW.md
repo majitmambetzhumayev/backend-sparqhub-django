@@ -101,6 +101,44 @@ scenario not covered by the current fix.
   successfully from a real conversation.
 - ❌ SSE transport has never been exercised against a real SSE MCP server —
   only unit-tested with mocks. stdio is the only transport confirmed live.
+- ✅ **Security fix (2026-08-26): MCP tool calls now require human
+  confirmation by default** (`MCPServer.requires_confirmation`, default
+  `True`). Previously an MCP tool executed with zero confirmation regardless
+  of the privileges its own backend granted (e.g. a SQL-capable tool) —
+  and `search_project_files` feeds raw, user-uploaded document text
+  straight into the model's context, so a planted prompt injection could
+  drive a real MCP tool call with no human in the loop. Unit tested
+  (confirmed/declined/no-callback-fails-closed); not yet live-verified
+  against a real SSE MCP server exposing a genuinely sensitive tool.
+  `search_project_files` output is also now explicitly framed as untrusted
+  data in the tool result text — reduces, doesn't eliminate, the odds the
+  model acts on injected instructions in the first place.
+- Same session: introduced an `AgentTool` registry (`ai_providers/chat_router.py`)
+  unifying every tool — built-in (`generate_image`, `search_project_files`,
+  `delegate_to_model`) or MCP-provided — behind one shape (schema + executor
+  + `requires_confirmation` + `confirmation_label`) and one dispatch point
+  (`_build_combined_executor`). Adding a new tool, or requiring confirmation
+  on one, no longer means editing dispatch logic. See
+  `ai_providers/tests/test_chat_router.py::BuildCombinedExecutorTest` for the
+  gate tested generically, independent of any specific tool.
+- ⚠️ **Known gap, not yet started: pending tool confirmations don't survive
+  a process restart.** `chat_messages/generation_registry.py` holds the
+  paused-turn state (an `asyncio.Future`) purely in-memory, scoped to the
+  single ASGI process — a restart mid-confirmation silently loses it (the
+  300s `CONFIRMATION_TIMEOUT_SECONDS` auto-declines eventually, but the
+  turn itself doesn't resume). Planned fix is a small DB-backed
+  `PendingToolConfirmation` record + a resume path, explicitly *not* a full
+  LangGraph-style graph/checkpointer rewrite (agent_loop.py is a linear
+  loop with one interrupt point, not a branching workflow) — see the
+  memory notes for the reasoning if picking this back up.
+- **Direction, not yet started: multi-agent orchestration.** Today the only
+  "agentic" mechanism beyond a single assistant's tool loop is
+  `delegate_to_model` (a manual, one-shot escalation). The `AgentTool`
+  registry above and the pending-confirmation persistence work are both
+  useful regardless, but whether to adopt LangGraph for actual
+  orchestration (vs. continuing to hand-roll it) is an explicit, deferred
+  decision — not to be assumed either way without revisiting once
+  multi-agent work has a concrete shape.
 
 ## Image generation (`generate_image` tool)
 
@@ -132,6 +170,9 @@ scenario not covered by the current fix.
   works, covered by tests including a disconnect-while-pending case, but it's
   the newest and most structurally unusual piece of the WS layer. Worth a
   second pair of eyes if anyone touches `consumers.py` later.
+- Its confirmation gate is no longer special-cased to this tool — see the
+  MCP tool integration section above: `_require_confirmation` and the
+  `AgentTool` registry now apply the same gate to any tool that opts in.
 
 ## Admin / user management
 
