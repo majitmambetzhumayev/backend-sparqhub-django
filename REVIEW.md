@@ -121,16 +121,29 @@ scenario not covered by the current fix.
   on one, no longer means editing dispatch logic. See
   `ai_providers/tests/test_chat_router.py::BuildCombinedExecutorTest` for the
   gate tested generically, independent of any specific tool.
-- ⚠️ **Known gap, not yet started: pending tool confirmations don't survive
-  a process restart.** `chat_messages/generation_registry.py` holds the
-  paused-turn state (an `asyncio.Future`) purely in-memory, scoped to the
-  single ASGI process — a restart mid-confirmation silently loses it (the
-  300s `CONFIRMATION_TIMEOUT_SECONDS` auto-declines eventually, but the
-  turn itself doesn't resume). Planned fix is a small DB-backed
-  `PendingToolConfirmation` record + a resume path, explicitly *not* a full
-  LangGraph-style graph/checkpointer rewrite (agent_loop.py is a linear
-  loop with one interrupt point, not a branching workflow) — see the
-  memory notes for the reasoning if picking this back up.
+- ✅ **Interim fix (2026-08-27): a restart mid-confirmation no longer loses
+  the turn silently.** `chat_messages/generation_registry.py` still holds
+  the actual paused-turn state (an `asyncio.Future`) purely in-memory,
+  scoped to the single ASGI process — that part is unchanged and a restart
+  still kills it. What's new: `chat_messages.models.PendingToolConfirmation`
+  durably records that a confirmation was pending (thread, tool, arguments,
+  user's message) the moment `confirm_tool_call` starts waiting, deleted the
+  moment it resolves. `_join_thread` (`consumers.py`) checks for a stale row
+  when `generation_registry` shows nothing active, and tells a reconnecting
+  client their turn was interrupted instead of leaving them waiting on a
+  `confirm_required` prompt that will now never arrive. Unit tested:
+  `chat_messages/tests.py::test_pending_tool_confirmation_row_tracks_the_in_memory_pause`,
+  `test_join_thread_reports_interrupted_turn_after_restart`,
+  `test_join_thread_with_no_pending_confirmation_sends_nothing`.
+- ⚠️ **Deliberately NOT a fix for the underlying gap** — this does not
+  resume the paused tool call, only reports that it was interrupted. A true
+  fix needs to rebuild the paused state and continue (à la LangGraph's
+  `interrupt()`/checkpointer), which is bigger and was explicitly deferred:
+  the provider's tool-call response isn't serializable in a
+  provider-agnostic way, and naively replaying it risks re-running side
+  effects (e.g. double-charging credits — see the idempotency note from the
+  LangGraph `interrupt()` discussion in the memory notes). When that real
+  fix lands, it should replace `PendingToolConfirmation`, not extend it.
 - **Direction, not yet started: multi-agent orchestration.** Today the only
   "agentic" mechanism beyond a single assistant's tool loop is
   `delegate_to_model` (a manual, one-shot escalation). The `AgentTool`

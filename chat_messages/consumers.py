@@ -8,6 +8,7 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
 
 from chat_messages import generation_registry
+from chat_messages.models import PendingToolConfirmation
 from core.rate_limit import check_rate_limit
 from chat_messages.services import run_and_broadcast_turn
 from librarian.services import retrieve_relevant_memories
@@ -168,6 +169,21 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(group_name, self.channel_name)
         self._joined_groups.add(group_name)
         if not generation_registry.is_active(thread_id):
+            # generation_registry is purely in-memory, so it's always empty
+            # right after a process restart — a PendingToolConfirmation row
+            # surviving that (see its docstring) means a turn on this thread
+            # was interrupted mid-confirmation and, since nothing is
+            # persisted to Message until a turn completes, is otherwise gone
+            # without a trace. This is a durability net, not true resume:
+            # tell the client plainly rather than leaving them waiting on a
+            # confirm_required prompt that will now never arrive.
+            stale = await sync_to_async(PendingToolConfirmation.objects.filter(thread_id=thread_id).first)()
+            if stale is not None:
+                await sync_to_async(PendingToolConfirmation.objects.filter(thread_id=thread_id).delete)()
+                await self._safe_send({
+                    "error": "Your previous request was interrupted before it could complete. Please send it again.",
+                    "thread_id": thread_id,
+                })
             return
         # Nothing is persisted to the DB mid-turn, so this pair is the only
         # record of what's happened so far — without it, a client that

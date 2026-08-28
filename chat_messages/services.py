@@ -9,7 +9,7 @@ from django.db.models import Sum
 from ai_providers.chat_router import (
     InsufficientCreditsError, send_chat_message, deduct_credits, compute_turn_cost_usd,
 )
-from chat_messages.models import Message
+from chat_messages.models import Message, PendingToolConfirmation
 from librarian.tasks import extract_memories_task
 from threads.models import Thread
 from threads.tasks import generate_thread_title_task
@@ -168,6 +168,16 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         # again via _join_thread, instead of only a generic "resuming" they
         # have no way to act on.
         generation_registry.set_pending_confirmation(thread.id, future, tool_name, arguments)
+        # Durability net alongside the in-memory registry above, not a
+        # replacement — see PendingToolConfirmation's docstring. If this
+        # process dies before the future resolves, generation_registry is
+        # gone on restart with it, but this DB row lets _join_thread tell a
+        # reconnecting client their turn was interrupted instead of it
+        # silently vanishing (nothing else about an in-flight turn is
+        # persisted until it completes).
+        await sync_to_async(PendingToolConfirmation.objects.create)(
+            thread=thread, tool_name=tool_name, arguments=arguments, user_text=text,
+        )
         # thread_id rides along so a client that doesn't know it yet (a
         # brand-new thread, mid-first-turn, before the 'done' frame ever
         # delivers an id) can still reply with the right thread_id.
@@ -182,6 +192,7 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
             return False
         finally:
             generation_registry.clear_pending_confirmation(thread.id)
+            await sync_to_async(PendingToolConfirmation.objects.filter(thread_id=thread.id).delete)()
 
     # Defined before the try, not inside it, so the except asyncio.CancelledError
     # branch below can reference them safely even if cancellation strikes

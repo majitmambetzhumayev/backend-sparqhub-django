@@ -38,3 +38,29 @@ class Message(models.Model):
 
     def __str__(self):
         return f"Message {self.id} in Thread {self.thread.id}"
+
+
+class PendingToolConfirmation(models.Model):
+    """A durability net around generation_registry's in-memory pending
+    confirmation, NOT a true resume mechanism — see chat_messages/services.py's
+    confirm_tool_call and REVIEW.md for what a real fix would need (the
+    provider's tool-call response isn't serializable in a provider-agnostic
+    way, and naively replaying a tool call risks re-running side effects,
+    e.g. double-charging credits). This model only exists so a process
+    restart while a confirmation is pending is surfaced to the client as a
+    clear "please resend" instead of the turn silently vanishing (nothing
+    is written to Message until the whole turn completes, so today there's
+    no trace of it at all).
+
+    Written right before confirm_tool_call starts waiting, deleted the
+    moment it resolves (confirmed, declined, or timed out) — at most one row
+    per thread at any instant, by construction (generation_registry.try_claim
+    already prevents two concurrent turns on the same thread)."""
+    thread = models.ForeignKey(Thread, on_delete=models.CASCADE, related_name='pending_tool_confirmations')
+    tool_name = models.CharField(max_length=255)
+    arguments = models.JSONField(default=dict)
+    user_text = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"PendingToolConfirmation({self.tool_name}) on Thread {self.thread_id}"

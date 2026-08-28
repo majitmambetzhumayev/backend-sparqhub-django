@@ -68,12 +68,21 @@ theoretical one).
 `True` — opt a specific server out only if its tools are genuinely
 read-only/low-risk.
 
-**Known gap, not yet started**: the confirmation pause itself
-(`chat_messages/generation_registry.py`) is a plain in-memory
-`asyncio.Future`, scoped to the single ASGI process — doesn't survive a
-restart. Planned fix is a DB-backed pending-confirmation record + a resume
-path, not a full graph/checkpointer rewrite (this codebase's agent loop is
-linear, not a branching workflow — see `ai_providers/agent_loop.py`).
+The confirmation pause itself (`chat_messages/generation_registry.py`) is a
+plain in-memory `asyncio.Future`, scoped to the single ASGI process — a
+restart mid-confirmation loses it. **`chat_messages.models.PendingToolConfirmation`
+is an interim fix for this, not the real one**: it durably records that a
+confirmation was pending (thread, tool, arguments, the user's message) so a
+reconnecting client after a restart gets a clear "please resend" instead of
+the turn silently vanishing (`_join_thread` in `consumers.py`). It does
+**not** resume the actual paused tool call — the provider's tool-call
+response isn't serializable in a provider-agnostic way, and naively
+replaying it risks re-running side effects (e.g. double-charging credits).
+A true fix (rebuild the paused state and continue, à la LangGraph's
+`interrupt()`/checkpointer) is bigger, deliberately deferred, and should
+replace this model rather than sit alongside it once built — don't treat
+`PendingToolConfirmation` as a design to extend.
+
 Multi-agent orchestration is a real direction for this product, but
 whether that eventually justifies adopting something like LangGraph is an
 explicit, deferred decision — don't assume either way.
