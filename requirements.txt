@@ -12,7 +12,12 @@ djangorestframework
 djangorestframework-simplejwt
 google-genai
 httpx
-mcp>=1.2.0
+# <2 pinned: mcp_server/server.py uses the 1.x FastMCP API, renamed/reshaped
+# in 2.x (see mcp.server.mcpserver.MCPServer + the 2.x migration guide) --
+# an unpinned install silently breaks mcp_server's tests the moment pip
+# resolves a 2.x release, which is exactly what happened to CI between the
+# 2026-07-27 green run and now.
+mcp>=1.2.0,<2
 mistralai
 openai
 # Pinned (unlike the rest of this file) -- an unpinned install resolves
