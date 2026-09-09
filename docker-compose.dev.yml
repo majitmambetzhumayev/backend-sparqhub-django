@@ -63,8 +63,11 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    # WEB_PORT lets a machine with something else already on 8000 remap the
+    # host side without editing this file — defaults to 8000 for everyone
+    # else. Set it in .env (gitignored, local-only), not here.
     ports:
-      - "8000:8000"
+      - "${WEB_PORT:-8000}:8000"
 
   celery:
     <<: *app
