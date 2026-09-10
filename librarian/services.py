@@ -17,9 +17,38 @@ _EXTRACTION_PROMPT_NAME = 'memory_extraction_system'
 # internal infra, not a user-requested AI response.
 _TOP_K = 5
 
+# Cosine distance below this is treated as "the same fact restated", not a
+# new one — e.g. "Allergic to peanuts." vs "Is allergic to peanuts" should
+# collapse, but two genuinely different facts shouldn't. Deliberately
+# conservative (only very close paraphrases collapse): merging two
+# different facts would be worse than occasionally missing a duplicate.
+# Not empirically tuned against real usage yet, same caveat as
+# project_files' chunk size default.
+_DEDUP_MAX_DISTANCE = 0.05
+
+
+def _find_duplicate(user, embedding) -> MemoryEntry | None:
+    return (
+        MemoryEntry.objects
+        .filter(user=user)
+        .annotate(distance=CosineDistance('embedding', embedding))
+        .filter(distance__lte=_DEDUP_MAX_DISTANCE)
+        .order_by('distance')
+        .first()
+    )
+
 
 def store_memory(user, content: str) -> MemoryEntry:
     embedding = _embed(content)
+    # Restating the same fact across turns previously created a duplicate
+    # row every time (see REVIEW.md) — extraction runs per turn with no
+    # memory of what it already stored, so this is the only place that can
+    # catch it. Returns the existing entry unchanged rather than touching
+    # its created_at; ordering/retrieval is by embedding similarity, not
+    # recency, so there's nothing to gain from bumping it.
+    duplicate = _find_duplicate(user, embedding)
+    if duplicate is not None:
+        return duplicate
     return MemoryEntry.objects.create(user=user, content=content, embedding=embedding)
 
 

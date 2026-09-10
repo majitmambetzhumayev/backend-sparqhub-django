@@ -73,6 +73,36 @@ class EmbedTest(TestCase):
 
         self.assertEqual(results, ["close match"])
 
+    @patch('core.embeddings.Mistral')
+    def test_store_memory_skips_near_duplicate(self, mock_mistral_cls):
+        # Same embedding both times (a close paraphrase would land here in
+        # practice) -- second call must not create a second row.
+        mock_client = MagicMock()
+        mock_client.embeddings.create.return_value = self._mock_response([0.3] * 1024)
+        mock_mistral_cls.return_value = mock_client
+        user = User.objects.create_user(username='dedupuser', password='pass')
+
+        first = store_memory(user, "Allergic to peanuts.")
+        second = store_memory(user, "Is allergic to peanuts")
+
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(user.memories.count(), 1)
+
+    @patch('core.embeddings.Mistral')
+    def test_store_memory_keeps_genuinely_different_facts(self, mock_mistral_cls):
+        mock_client = MagicMock()
+        mock_client.embeddings.create.side_effect = [
+            self._mock_response([1.0] + [0.0] * 1023),
+            self._mock_response([0.0] * 1023 + [1.0]),   # orthogonal -- unrelated fact
+        ]
+        mock_mistral_cls.return_value = mock_client
+        user = User.objects.create_user(username='dedupuser2', password='pass')
+
+        store_memory(user, "Allergic to peanuts.")
+        store_memory(user, "Works as a data scientist.")
+
+        self.assertEqual(user.memories.count(), 2)
+
 
 class ExtractAndStoreMemoriesTest(TransactionTestCase):
     # TransactionTestCase (not TestCase) because extract_and_store_memories
