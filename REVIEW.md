@@ -160,11 +160,14 @@ scenario not covered by the current fix.
 - ✅ Live-verified: real images generated and displayed via both OpenAI
   (`gpt-image-2`) and Gemini (`gemini-2.5-flash-image`), persisted to local
   disk storage and rendered via Markdown in the chat.
-- ⚠️ **Storage is local disk (`MEDIA_ROOT`), not object storage.** Fine for
-  single-instance dev; will not survive a redeploy on most PaaS targets
-  (Railway/Render use ephemeral filesystems unless a volume is attached).
-  This needs to become S3-compatible storage before real deployment — not
-  done, not started.
+- ✅ **Correction (2026-09-09): Cloudflare R2 (S3-compatible) storage is
+  already implemented and confirmed working** (`STORAGES` in settings.py
+  switches to `S3Storage` whenever `R2_ACCESS_KEY_ID` is set; local disk is
+  just the dev fallback when it's blank). This note previously said "not
+  done, not started," which was wrong — only local dev credentials were
+  missing, not the code path. Whether prod is actually using R2 vs. local
+  disk is unverified from this checkout (no prod visibility), but the
+  capability itself is there and tested.
 - ❌ No cleanup/retention policy for generated images — they accumulate
   forever on disk.
 
@@ -214,10 +217,16 @@ scenario not covered by the current fix.
   + Redis service containers, migrations, `manage.py check`, full `pytest`
   run. Verified locally that every step it runs actually passes before
   relying on it.
-- ❌ Not deployed anywhere yet. Deployment architecture is decided (Vercel +
-  Railway/Render) but not executed — biggest remaining gap before a real MVP
-  launch, along with the image-storage issue above.
-- ❌ No Sentry/error tracking, no CSP/HSTS headers.
+- ⚠️ **Correction (2026-09-09): SparqHub is already live in production**
+  (Render, confirmed via DNS earlier — this note previously said "not
+  deployed anywhere yet," which was wrong). This local checkout has no
+  visibility into prod config/secrets/deploy state, so anything below about
+  "before a real MVP launch" should be read as "before this local dev
+  environment's gaps are closed," not as "the product isn't live" — it is.
+  R2 object storage (see Image generation section above) is also already
+  configured and confirmed working, contradicting the older note there too.
+- ❌ No Sentry/error tracking, no CSP/HSTS headers (as far as this local
+  checkout can tell — not verified against actual prod config).
 
 ## Explicitly out of scope this pass (not gaps, just not asked for)
 
