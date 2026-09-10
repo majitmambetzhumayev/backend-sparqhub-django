@@ -121,29 +121,36 @@ scenario not covered by the current fix.
   on one, no longer means editing dispatch logic. See
   `ai_providers/tests/test_chat_router.py::BuildCombinedExecutorTest` for the
   gate tested generically, independent of any specific tool.
-- ✅ **Interim fix (2026-08-27): a restart mid-confirmation no longer loses
-  the turn silently.** `chat_messages/generation_registry.py` still holds
-  the actual paused-turn state (an `asyncio.Future`) purely in-memory,
-  scoped to the single ASGI process — that part is unchanged and a restart
-  still kills it. What's new: `chat_messages.models.PendingToolConfirmation`
-  durably records that a confirmation was pending (thread, tool, arguments,
-  user's message) the moment `confirm_tool_call` starts waiting, deleted the
-  moment it resolves. `_join_thread` (`consumers.py`) checks for a stale row
-  when `generation_registry` shows nothing active, and tells a reconnecting
-  client their turn was interrupted instead of leaving them waiting on a
-  `confirm_required` prompt that will now never arrive. Unit tested:
-  `chat_messages/tests.py::test_pending_tool_confirmation_row_tracks_the_in_memory_pause`,
+- ✅ **Interim fix (2026-08-27, generalized 2026-09-09): a restart mid-turn
+  no longer loses it silently, at any point in the turn.**
+  `chat_messages/generation_registry.py` still holds the actual in-flight
+  turn state (an `asyncio.Future` for a confirmation wait, `streamed_text`
+  for a plain stream) purely in-memory, scoped to the single ASGI process —
+  that part is unchanged and a restart still kills it. What's durable:
+  `chat_messages.models.PendingTurn` records that a turn is in flight
+  (thread, user's message) from the moment `run_and_broadcast_turn` starts
+  it until it completes (success, stopped, errored, or insufficient
+  credits — cleared in the same `finally` that already releases
+  `generation_registry`). `_join_thread` (`consumers.py`) checks for a
+  stale row when `generation_registry` shows nothing active, and tells a
+  reconnecting client their turn was interrupted instead of leaving them
+  with no signal at all. Originally shipped narrower (as
+  `PendingToolConfirmation`, only spanning the tool-confirmation-wait
+  window) — generalized once it was clear a crash during *plain
+  streaming*, no tool call involved, left nothing behind whatsoever, not
+  even an error. Unit tested:
+  `chat_messages/tests.py::test_pending_turn_row_spans_the_whole_turn_not_just_confirmation`,
   `test_join_thread_reports_interrupted_turn_after_restart`,
-  `test_join_thread_with_no_pending_confirmation_sends_nothing`.
+  `test_join_thread_with_no_pending_turn_sends_nothing`.
 - ⚠️ **Deliberately NOT a fix for the underlying gap** — this does not
-  resume the paused tool call, only reports that it was interrupted. A true
+  resume the paused turn, only reports that it was interrupted. A true
   fix needs to rebuild the paused state and continue (à la LangGraph's
   `interrupt()`/checkpointer), which is bigger and was explicitly deferred:
   the provider's tool-call response isn't serializable in a
   provider-agnostic way, and naively replaying it risks re-running side
   effects (e.g. double-charging credits — see the idempotency note from the
   LangGraph `interrupt()` discussion in the memory notes). When that real
-  fix lands, it should replace `PendingToolConfirmation`, not extend it.
+  fix lands, it should replace `PendingTurn`, not extend it.
 - **Direction, not yet started: multi-agent orchestration.** Today the only
   "agentic" mechanism beyond a single assistant's tool loop is
   `delegate_to_model` (a manual, one-shot escalation). The `AgentTool`

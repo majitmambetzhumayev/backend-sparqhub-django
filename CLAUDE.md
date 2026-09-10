@@ -69,20 +69,25 @@ theoretical one).
 `True` — opt a specific server out only if its tools are genuinely
 read-only/low-risk.
 
-The confirmation pause itself (`chat_messages/generation_registry.py`) is a
-plain in-memory `asyncio.Future`, scoped to the single ASGI process — a
-restart mid-confirmation loses it. **`chat_messages.models.PendingToolConfirmation`
-is an interim fix for this, not the real one**: it durably records that a
-confirmation was pending (thread, tool, arguments, the user's message) so a
-reconnecting client after a restart gets a clear "please resend" instead of
-the turn silently vanishing (`_join_thread` in `consumers.py`). It does
-**not** resume the actual paused tool call — the provider's tool-call
-response isn't serializable in a provider-agnostic way, and naively
-replaying it risks re-running side effects (e.g. double-charging credits).
-A true fix (rebuild the paused state and continue, à la LangGraph's
-`interrupt()`/checkpointer) is bigger, deliberately deferred, and should
-replace this model rather than sit alongside it once built — don't treat
-`PendingToolConfirmation` as a design to extend.
+Any in-flight turn (`chat_messages/generation_registry.py`'s state, plus the
+`asyncio.Future` a confirmation-wait blocks on) is plain in-memory, scoped
+to the single ASGI process — a restart at any point loses it.
+**`chat_messages.models.PendingTurn` is an interim fix for this, not the
+real one**: it durably records that a turn is in flight (thread, the
+user's message) from the moment it starts until it completes, so a
+reconnecting client after a restart — whenever in the turn the crash
+happened, mid-stream or mid-tool-confirmation-wait — gets a clear "please
+resend" instead of the turn silently vanishing (`_join_thread` in
+`consumers.py`). It does **not** resume the actual paused turn — the
+provider's tool-call response isn't serializable in a provider-agnostic
+way, and naively replaying it risks re-running side effects (e.g.
+double-charging credits). A true fix (rebuild the paused state and
+continue, à la LangGraph's `interrupt()`/checkpointer) is bigger,
+deliberately deferred, and should replace this model rather than sit
+alongside it once built — don't treat `PendingTurn` as a design to extend.
+(Originally shipped as a narrower model, `PendingToolConfirmation`, that
+only covered the tool-confirmation-wait window — generalized once it was
+clear a crash during plain streaming left no signal at all.)
 
 Multi-agent orchestration is a real direction for this product, but
 whether that eventually justifies adopting something like LangGraph is an

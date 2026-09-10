@@ -87,12 +87,16 @@ needs to know whether it delegated to a single agent or an entire team.
   (a compiled graph embeddable as a single node in a parent graph) more
   closely than the earlier flat-delegation framing did. Worth
   re-evaluating once this is actually being built, not before.
-- **Durable resume is still only partial.** `PendingToolConfirmation`
-  (see `REVIEW.md`'s MCP integration section) only covers a turn paused
-  waiting on tool confirmation — a crash mid-stream with no pending
-  confirmation still loses the turn silently. Orchestration adds more ways
-  a turn can be mid-flight (waiting on a nested pod, say), so this gap
-  matters more once orchestration exists, not less.
+- **Durable resume is still only partial.** `PendingTurn` (see `REVIEW.md`'s
+  MCP integration section) now covers a crash anywhere in a turn's
+  lifetime — mid-stream, mid-tool-call, mid-confirmation-wait — with a
+  "please resend" signal, generalized from an earlier version that only
+  covered the confirmation-wait window. It still doesn't *resume* the
+  turn, only reports the interruption. Orchestration adds more ways a turn
+  can be mid-flight (waiting on a nested pod, say) — `PendingTurn` should
+  already cover those too (it's turn-level, not tied to any specific
+  sub-state), but confirm that holds once pods actually exist rather than
+  assuming it.
 
 ## How to apply
 
