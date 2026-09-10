@@ -4,7 +4,8 @@ Django + Channels backend for SparqHub: multi-provider AI chat (Anthropic,
 OpenAI, Mistral, Gemini), BYOK + credit metering, per-project MCP tools,
 image generation, long-term memory. See `REVIEW.md` for what's actually been
 verified vs. known gaps — keep that file updated as gaps close, don't
-replace it wholesale.
+replace it wholesale. See `ORCHESTRATION.md` for the multi-agent
+orchestration design (supervisor pattern, not implemented yet).
 
 ## Code philosophy
 
