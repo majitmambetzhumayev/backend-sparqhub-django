@@ -9,7 +9,7 @@ from django.db.models import Sum
 from ai_providers.chat_router import (
     InsufficientCreditsError, send_chat_message, deduct_credits, compute_turn_cost_usd,
 )
-from chat_messages.models import Message, PendingToolConfirmation
+from chat_messages.models import Message, PendingTurn
 from librarian.tasks import extract_memories_task
 from threads.models import Thread
 from threads.tasks import generate_thread_title_task
@@ -141,6 +141,11 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
     from chat_messages import generation_registry
 
     channel_layer = get_channel_layer()
+    # Durability net for the whole turn, not just the tool-confirmation-wait
+    # window (see PendingTurn's docstring) -- written before anything else
+    # so even a crash during the very first model call is covered. Cleared
+    # in the `finally` below regardless of how the turn ends.
+    await sync_to_async(PendingTurn.objects.create)(thread=thread, user_text=text)
     history = thread.conversation_state or []
     tool_calls: list[str] = []
 
@@ -168,16 +173,10 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         # again via _join_thread, instead of only a generic "resuming" they
         # have no way to act on.
         generation_registry.set_pending_confirmation(thread.id, future, tool_name, arguments)
-        # Durability net alongside the in-memory registry above, not a
-        # replacement — see PendingToolConfirmation's docstring. If this
-        # process dies before the future resolves, generation_registry is
-        # gone on restart with it, but this DB row lets _join_thread tell a
-        # reconnecting client their turn was interrupted instead of it
-        # silently vanishing (nothing else about an in-flight turn is
-        # persisted until it completes).
-        await sync_to_async(PendingToolConfirmation.objects.create)(
-            thread=thread, tool_name=tool_name, arguments=arguments, user_text=text,
-        )
+        # No separate DB write here -- the PendingTurn row created at the
+        # top of run_and_broadcast_turn already spans this whole window
+        # (and the rest of the turn besides), so it covers a crash during
+        # confirmation-wait too without a second, narrower durability net.
         # thread_id rides along so a client that doesn't know it yet (a
         # brand-new thread, mid-first-turn, before the 'done' frame ever
         # delivers an id) can still reply with the right thread_id.
@@ -192,7 +191,6 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
             return False
         finally:
             generation_registry.clear_pending_confirmation(thread.id)
-            await sync_to_async(PendingToolConfirmation.objects.filter(thread_id=thread.id).delete)()
 
     # Defined before the try, not inside it, so the except asyncio.CancelledError
     # branch below can reference them safely even if cancellation strikes
@@ -248,5 +246,6 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         return
     finally:
         generation_registry.release(thread.id)
+        await sync_to_async(PendingTurn.objects.filter(thread_id=thread.id).delete)()
 
     await channel_layer.group_send(group_name, {"type": "chat.done", "thread_id": thread.id})

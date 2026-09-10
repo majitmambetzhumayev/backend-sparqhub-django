@@ -19,7 +19,7 @@ from ai_providers.chat_router import InsufficientCreditsError
 from assistants.models import Assistant
 from chat_messages import generation_registry
 from chat_messages.consumers import ConversationConsumer
-from chat_messages.models import Message, PendingToolConfirmation
+from chat_messages.models import Message, PendingTurn
 from chat_messages.services import get_usage_summary, send_message, _deduct_credits_after_persisted_turn, _record_turn
 from projects.models import Project
 from threads.models import Thread
@@ -1080,13 +1080,16 @@ class ConversationConsumerTest(TransactionTestCase):
     @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
     @patch("chat_messages.services.send_chat_message")
-    def test_pending_tool_confirmation_row_tracks_the_in_memory_pause(
+    def test_pending_turn_row_spans_the_whole_turn_not_just_confirmation(
         self, mock_send, mock_memories, mock_extract_task, mock_title_task,
     ):
-        # Durability net around generation_registry's in-memory pending
-        # confirmation (see PendingToolConfirmation's docstring) — this
-        # asserts the DB row's lifecycle mirrors the in-memory one: present
-        # while confirm_tool_call is awaiting, gone once it resolves.
+        # PendingTurn replaced a narrower model (PendingToolConfirmation)
+        # that only existed during a tool-confirmation wait -- a crash
+        # during plain streaming (no tool call involved) left nothing
+        # behind at all. This asserts the row is already present *before*
+        # any confirmation happens (i.e. it would also cover a crash during
+        # plain streaming), stays present through the confirmation wait,
+        # and is gone once the turn completes.
         async def fake_send_chat_message(*args, **kwargs):
             confirmed = await kwargs["confirm_tool_call"]("delegate_to_model", {"provider": "gemini"})
 
@@ -1105,11 +1108,12 @@ class ConversationConsumerTest(TransactionTestCase):
 
             await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
             await communicator.receive_json_from()  # thinking
-            await communicator.receive_json_from()  # confirm_required
 
-            row_while_pending = await sync_to_async(
-                PendingToolConfirmation.objects.filter(thread_id=self.existing_thread.id).first
+            row_before_confirmation = await sync_to_async(
+                PendingTurn.objects.filter(thread_id=self.existing_thread.id).first
             )()
+
+            await communicator.receive_json_from()  # confirm_required
 
             await communicator.send_json_to(
                 {"type": "tool_confirmation", "thread_id": self.existing_thread.id, "confirmed": True},
@@ -1118,29 +1122,26 @@ class ConversationConsumerTest(TransactionTestCase):
             await communicator.receive_json_from()  # done
 
             rows_after_resolved = await sync_to_async(
-                PendingToolConfirmation.objects.filter(thread_id=self.existing_thread.id).count
+                PendingTurn.objects.filter(thread_id=self.existing_thread.id).count
             )()
 
             await communicator.disconnect()
-            return row_while_pending, rows_after_resolved
+            return row_before_confirmation, rows_after_resolved
 
-        row_while_pending, rows_after_resolved = run(scenario())
-        self.assertIsNotNone(row_while_pending)
-        self.assertEqual(row_while_pending.tool_name, "delegate_to_model")
-        self.assertEqual(row_while_pending.arguments, {"provider": "gemini"})
-        self.assertEqual(row_while_pending.user_text, "Hi")
+        row_before_confirmation, rows_after_resolved = run(scenario())
+        self.assertIsNotNone(row_before_confirmation)
+        self.assertEqual(row_before_confirmation.user_text, "Hi")
         self.assertEqual(rows_after_resolved, 0)
 
     def test_join_thread_reports_interrupted_turn_after_restart(self):
         # Simulates reconnecting after a process restart: generation_registry
         # is empty (nothing ran in-process for this thread), but a
-        # PendingToolConfirmation row survived from before the restart — the
-        # one signal available that a turn was interrupted, since nothing
-        # else about an in-flight turn is persisted until it completes.
-        PendingToolConfirmation.objects.create(
-            thread=self.existing_thread, tool_name="delegate_to_model",
-            arguments={"provider": "gemini"}, user_text="Hi",
-        )
+        # PendingTurn row survived from before the restart — the one signal
+        # available that a turn was interrupted, since nothing else about an
+        # in-flight turn is persisted until it completes. Doesn't matter
+        # *when* in the turn the crash happened (mid-stream or mid-tool-call)
+        # -- PendingTurn spans the whole thing either way.
+        PendingTurn.objects.create(thread=self.existing_thread, user_text="Hi")
 
         async def scenario():
             communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
@@ -1157,9 +1158,9 @@ class ConversationConsumerTest(TransactionTestCase):
         frame = run(scenario())
         self.assertIn("interrupted", frame["error"])
         self.assertEqual(frame["thread_id"], self.existing_thread.id)
-        self.assertEqual(PendingToolConfirmation.objects.filter(thread=self.existing_thread).count(), 0)
+        self.assertEqual(PendingTurn.objects.filter(thread=self.existing_thread).count(), 0)
 
-    def test_join_thread_with_no_pending_confirmation_sends_nothing(self):
+    def test_join_thread_with_no_pending_turn_sends_nothing(self):
         # Baseline: a plain, never-generated-on thread shouldn't get an
         # interrupted-turn error just because generation_registry is empty —
         # that's the normal case for most joins, not evidence of a crash.
