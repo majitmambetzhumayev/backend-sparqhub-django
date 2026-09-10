@@ -55,6 +55,34 @@ class ObservabilitySpanTest(SimpleTestCase):
         self.assertEqual(span.attributes['gen_ai.usage.input_tokens'], 12)
         self.assertEqual(span.attributes['gen_ai.usage.output_tokens'], 7)
 
+    def test_span_carries_finish_reason_when_present(self):
+        # Previously only a logger.warning() (see
+        # base.py::warn_if_finish_reason_suspicious) -- now also a span
+        # attribute, so it's queryable in a trace backend instead of only
+        # visible by reading raw logs.
+        provider = MagicMock()
+        provider.label = 'Anthropic'
+        provider.complete = AsyncMock(
+            return_value=ProviderResponse(text='Hi', tool_calls=[], finish_reason='max_tokens'),
+        )
+        assistant = MagicMock(model='claude-sonnet-5')
+
+        run(run_agent_loop(provider, assistant, [], 'sys', [], None))
+
+        span = self.exporter.get_finished_spans()[0]
+        self.assertEqual(span.attributes['gen_ai.response.finish_reason'], 'max_tokens')
+
+    def test_span_omits_finish_reason_when_absent(self):
+        provider = MagicMock()
+        provider.label = 'Anthropic'
+        provider.complete = AsyncMock(return_value=ProviderResponse(text='Hi', tool_calls=[]))
+        assistant = MagicMock(model='claude-sonnet-5')
+
+        run(run_agent_loop(provider, assistant, [], 'sys', [], None))
+
+        span = self.exporter.get_finished_spans()[0]
+        self.assertNotIn('gen_ai.response.finish_reason', span.attributes)
+
     def test_tool_call_span_carries_gen_ai_attributes(self):
         provider = MagicMock()
         provider.label = 'Anthropic'

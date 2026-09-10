@@ -37,13 +37,18 @@ async def run_agent_loop(
     else:
         with llm_call_span(provider_name, assistant.model) as span:
             response = await provider.complete(assistant, messages, system, tools)
-            if response.usage:
-                record_llm_usage(
-                    span, response_model=assistant.model,
-                    input_tokens=response.usage.get("input_tokens"), output_tokens=response.usage.get("output_tokens"),
-                )
-                if usage is not None:
-                    usage.add(**response.usage)
+            # Unconditional now (previously gated behind `if response.usage`,
+            # which also silently skipped recording finish_reason whenever a
+            # provider call carried no usage data) -- record_llm_usage
+            # already no-ops per field when a value is None.
+            record_llm_usage(
+                span, response_model=assistant.model,
+                input_tokens=response.usage.get("input_tokens") if response.usage else None,
+                output_tokens=response.usage.get("output_tokens") if response.usage else None,
+                finish_reason=response.finish_reason,
+            )
+            if response.usage and usage is not None:
+                usage.add(**response.usage)
     iterations = 0
     while response.requires_tool_execution and tool_executor:
         iterations += 1
@@ -59,12 +64,13 @@ async def run_agent_loop(
         messages = provider.append_turn(messages, response, tool_results=results)
         with llm_call_span(provider_name, assistant.model) as span:
             response = await provider.complete(assistant, messages, system, tools)
-            if response.usage:
-                record_llm_usage(
-                    span, response_model=assistant.model,
-                    input_tokens=response.usage.get("input_tokens"), output_tokens=response.usage.get("output_tokens"),
-                )
-                if usage is not None:
-                    usage.add(**response.usage)
+            record_llm_usage(
+                span, response_model=assistant.model,
+                input_tokens=response.usage.get("input_tokens") if response.usage else None,
+                output_tokens=response.usage.get("output_tokens") if response.usage else None,
+                finish_reason=response.finish_reason,
+            )
+            if response.usage and usage is not None:
+                usage.add(**response.usage)
     warn_if_finish_reason_suspicious(response)
     return response.text

@@ -64,13 +64,22 @@ def llm_call_span(provider_name: str, model: str):
         yield span
 
 
-def record_llm_usage(span, *, response_model: str | None, input_tokens: int | None, output_tokens: int | None) -> None:
+def record_llm_usage(
+    span, *, response_model: str | None, input_tokens: int | None, output_tokens: int | None,
+    finish_reason: str | None = None,
+) -> None:
     if response_model:
         span.set_attribute("gen_ai.response.model", response_model)
     if input_tokens is not None:
         span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
     if output_tokens is not None:
         span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+    if finish_reason is not None:
+        # Was previously only a logger.warning() (see
+        # base.py::warn_if_finish_reason_suspicious) -- on a span, this
+        # became queryable ("show me every turn that got truncated/
+        # content-filtered") instead of only visible by reading raw logs.
+        span.set_attribute("gen_ai.response.finish_reason", finish_reason)
 
 
 @contextmanager
