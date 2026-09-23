@@ -197,6 +197,48 @@ scenario not covered by the current fix.
   MCP tool integration section above: `_require_confirmation` and the
   `AgentTool` registry now apply the same gate to any tool that opts in.
 
+## Multi-agent orchestration (`delegate_to_agent`)
+
+First real slice of `ORCHESTRATION.md`'s supervisor-pattern design — an
+agent can delegate to another of the user's own `Assistant`s, matched by a
+declared `role` (e.g. "accounting"), recursively.
+
+- ✅ Unit tested: tool offered only when another assistant with a non-blank
+  role exists (excludes the current assistant itself and role-less ones),
+  dispatch to the correct target with `delegation_depth` incremented,
+  unknown `agent_id` handled without dispatching, confirmation gate
+  (`requires_confirmation=True`, `confirmation_label="this agent
+  delegation"`), credit deduction on the delegated hop only when it used
+  the global key.
+- ✅ Recursion bounded: `MAX_DELEGATION_DEPTH = 3`, enforced at
+  `send_chat_message`'s call site (not inside the tool builder itself) —
+  past that depth the tool simply isn't offered. Unit tested via
+  `send_chat_message(..., delegation_depth=MAX_DELEGATION_DEPTH)`.
+- ✅ Cost roll-up through nested delegation verified: each level's own
+  `deduct_credits` call fires independently when its own `send_chat_message`
+  resolves, so a chain deducts correctly without double-counting or losing
+  a hop — this was ORCHESTRATION.md's open "cost/credit attribution"
+  question, now resolved by the existing per-level pattern rather than new
+  logic.
+- Deliberate difference from `delegate_to_model`: `confirm_tool_call` **is**
+  threaded through the recursive call. `delegate_to_model`'s target is a
+  bare stub with no tool access, so a missing confirmation channel never
+  mattered; a delegated real `Assistant` can have MCP tools with
+  `requires_confirmation=True`, and without this they'd silently fail-closed
+  instead of pausing for the user via the existing WS flow.
+- ✅ Live-verified against the real DB (not mocks): created a role-less and
+  a `role='accounting'` assistant via the ORM, confirmed the serializer
+  round-trips `role`, and confirmed `_build_delegate_to_agent_tool` offers
+  `delegate_to_agent` with the right schema against real query results.
+- ⏳ Not yet live-verified over the real WebSocket with an actual LLM call
+  choosing to delegate and a user confirming in the UI (the `delegate_to_model`
+  section above has that full pass; this doesn't yet) — do this before
+  considering the feature done, not just unit/DB-tested.
+- Out of scope for this slice, by design: no `Team`/pod grouping concept
+  (`ORCHESTRATION.md` explicitly defers it — adding it later doesn't
+  require restructuring this delegation interface). LangGraph vs.
+  hand-rolled stays an open, deferred decision.
+
 ## Admin / user management
 
 - ✅ Unit tested: permission boundary (`IsAdminUser`/`is_staff`) on every

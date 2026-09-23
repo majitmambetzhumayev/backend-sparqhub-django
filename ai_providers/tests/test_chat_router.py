@@ -10,8 +10,10 @@ from ai_providers.factory import PROVIDERS
 from ai_providers.chat_router import (
     AgentTool,
     InsufficientCreditsError,
+    MAX_DELEGATION_DEPTH,
     _build_combined_executor,
     _build_delegate_tool,
+    _build_delegate_to_agent_tool,
     _build_file_search_tool,
     _build_image_tool,
     _compute_cost_credits,
@@ -652,6 +654,186 @@ class SendChatMessageDelegateToolTest(TransactionTestCase):
 
         tool_names = [t['name'] for t in mock_run_loop.call_args.args[4]]
         self.assertNotIn('delegate_to_model', tool_names)
+
+
+class BuildDelegateToAgentToolTest(TransactionTestCase):
+    """delegate_to_agent generalizes delegate_to_model: instead of a fixed
+    provider enum, it delegates to another of the user's own Assistants,
+    matched by role. Every test here calls .executor directly, i.e. as if
+    already confirmed — same convention as BuildDelegateToolTest."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='delegateagentuser', password='pass', credits_remaining=100)
+        self.supervisor = Assistant.objects.create(
+            user=self.user, name='Supervisor', instructions='Be helpful.', ai_provider='anthropic',
+        )
+
+    def _build(self, delegation_depth=0, confirm_tool_call=None):
+        return run(_build_delegate_to_agent_tool(
+            self.user, self.supervisor, delegation_depth, project_id=None,
+            on_tool_call=None, on_delegate_start=None, confirm_tool_call=confirm_tool_call,
+        ))
+
+    def test_returns_none_when_no_other_assistant_has_a_role(self):
+        # An assistant exists, but with no role set -- not a valid delegation
+        # target (role is the matching key the design relies on).
+        Assistant.objects.create(user=self.user, name='B', ai_provider='anthropic')
+
+        self.assertIsNone(self._build())
+
+    def test_excludes_the_current_assistant_itself(self):
+        self.supervisor.role = 'general'
+        self.supervisor.save()
+
+        self.assertIsNone(self._build())
+
+    def test_lists_eligible_agents_in_the_schema(self):
+        accountant = Assistant.objects.create(
+            user=self.user, name='Accountant', ai_provider='anthropic', role='accounting',
+        )
+
+        tool = self._build()
+
+        self.assertIn(f'id={accountant.id}: Accountant (role: accounting)', tool.schema['description'])
+        self.assertEqual(tool.schema['input_schema']['properties']['agent_id']['enum'], [accountant.id])
+
+    def test_requires_confirmation_with_a_natural_label(self):
+        Assistant.objects.create(user=self.user, name='Accountant', ai_provider='anthropic', role='accounting')
+
+        tool = self._build()
+
+        self.assertTrue(tool.requires_confirmation)
+        self.assertEqual(tool.confirmation_label, 'this agent delegation')
+
+    def test_unknown_agent_id_returns_error_text_without_dispatching(self):
+        Assistant.objects.create(user=self.user, name='Accountant', ai_provider='anthropic', role='accounting')
+        tool = self._build()
+
+        result = run(tool.executor({'agent_id': 999999, 'prompt': 'hi', 'reason': 'x'}))
+
+        self.assertIn('Unknown agent id', result)
+
+    @patch('ai_providers.chat_router.send_chat_message', new_callable=AsyncMock)
+    def test_dispatches_to_the_target_agent_with_incremented_depth(self, mock_send):
+        accountant = Assistant.objects.create(
+            user=self.user, name='Accountant', ai_provider='gemini', model='gemini-2.5-flash', role='accounting',
+        )
+        mock_send.return_value = ('Here is your report', UsageAccumulator(), False)
+        confirm_tool_call = AsyncMock(return_value=True)
+        tool = self._build(delegation_depth=1, confirm_tool_call=confirm_tool_call)
+
+        result = run(tool.executor({'agent_id': accountant.id, 'prompt': 'Q3 numbers?', 'reason': 'finance role'}))
+
+        self.assertIn('Here is your report', result)
+        self.assertIn("agent 'Accountant'", result)
+        call_kwargs = mock_send.call_args.kwargs
+        self.assertEqual(call_kwargs['ai_provider'], 'gemini')
+        self.assertEqual(call_kwargs['model'], 'gemini-2.5-flash')
+        self.assertEqual(call_kwargs['delegation_depth'], 2)
+        # Deliberate difference from delegate_to_model: a real delegated
+        # Assistant can have its own MCP tools requiring confirmation, so
+        # the live confirmation channel must be threaded through rather
+        # than silently fail-closing.
+        self.assertIs(call_kwargs['confirm_tool_call'], confirm_tool_call)
+
+    @patch('ai_providers.chat_router.send_chat_message', new_callable=AsyncMock)
+    def test_deducts_credits_when_delegated_call_used_global_key(self, mock_send):
+        accountant = Assistant.objects.create(
+            user=self.user, name='Accountant', ai_provider='anthropic', model='claude-sonnet-5', role='accounting',
+        )
+        usage = UsageAccumulator(input_tokens=1_000_000, output_tokens=1_000_000)
+        mock_send.return_value = ('OK', usage, True)
+        tool = self._build()
+
+        run(tool.executor({'agent_id': accountant.id, 'prompt': 'hi', 'reason': 'x'}))
+
+        self.user.refresh_from_db()
+        # claude-sonnet-5: $3/$15 per 1M tokens = $18 = 1800 credits.
+        self.assertEqual(self.user.credits_remaining, 100 - 1800)
+
+    @patch('ai_providers.chat_router.send_chat_message', new_callable=AsyncMock)
+    def test_does_not_deduct_credits_when_delegated_call_used_personal_key(self, mock_send):
+        accountant = Assistant.objects.create(
+            user=self.user, name='Accountant', ai_provider='anthropic', model='claude-sonnet-5', role='accounting',
+        )
+        usage = UsageAccumulator(input_tokens=1_000_000, output_tokens=1_000_000)
+        mock_send.return_value = ('OK', usage, False)
+        tool = self._build()
+
+        run(tool.executor({'agent_id': accountant.id, 'prompt': 'hi', 'reason': 'x'}))
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.credits_remaining, 100)
+
+
+class SendChatMessageDelegateToAgentToolTest(TransactionTestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='sendagentuser', password='pass', credits_remaining=100)
+
+    @patch('ai_providers.chat_router.get_provider')
+    @patch('ai_providers.chat_router.run_agent_loop', new_callable=AsyncMock, return_value='Hi there!')
+    @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
+    def test_included_when_an_eligible_target_exists(self, mock_get_key, mock_run_loop, mock_get_provider):
+        assistant = Assistant.objects.create(
+            user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
+        )
+        Assistant.objects.create(user=self.user, name='Accountant', ai_provider='anthropic', role='accounting')
+        mock_get_provider.return_value = _mock_provider()
+
+        run(send_chat_message(assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user))
+
+        tool_names = [t['name'] for t in mock_run_loop.call_args.args[4]]
+        self.assertIn('delegate_to_agent', tool_names)
+
+    @patch('ai_providers.chat_router.get_provider')
+    @patch('ai_providers.chat_router.run_agent_loop', new_callable=AsyncMock, return_value='Hi there!')
+    @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
+    def test_excluded_when_no_eligible_target(self, mock_get_key, mock_run_loop, mock_get_provider):
+        assistant = Assistant.objects.create(
+            user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
+        )
+        mock_get_provider.return_value = _mock_provider()
+
+        run(send_chat_message(assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user))
+
+        tool_names = [t['name'] for t in mock_run_loop.call_args.args[4]]
+        self.assertNotIn('delegate_to_agent', tool_names)
+
+    @patch('ai_providers.chat_router.get_provider')
+    @patch('ai_providers.chat_router.run_agent_loop', new_callable=AsyncMock, return_value='Hi there!')
+    @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
+    def test_excluded_when_delegation_disallowed(self, mock_get_key, mock_run_loop, mock_get_provider):
+        assistant = Assistant.objects.create(
+            user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
+        )
+        Assistant.objects.create(user=self.user, name='Accountant', ai_provider='anthropic', role='accounting')
+        mock_get_provider.return_value = _mock_provider()
+
+        run(send_chat_message(
+            assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user,
+            allow_delegation=False,
+        ))
+
+        tool_names = [t['name'] for t in mock_run_loop.call_args.args[4]]
+        self.assertNotIn('delegate_to_agent', tool_names)
+
+    @patch('ai_providers.chat_router.get_provider')
+    @patch('ai_providers.chat_router.run_agent_loop', new_callable=AsyncMock, return_value='Hi there!')
+    @patch('keys.services.get_user_api_key', new_callable=AsyncMock, return_value=None)
+    def test_excluded_at_max_delegation_depth(self, mock_get_key, mock_run_loop, mock_get_provider):
+        assistant = Assistant.objects.create(
+            user=self.user, name='A', instructions='Be helpful.', ai_provider='anthropic',
+        )
+        Assistant.objects.create(user=self.user, name='Accountant', ai_provider='anthropic', role='accounting')
+        mock_get_provider.return_value = _mock_provider()
+
+        run(send_chat_message(
+            assistant, 'Hello', ai_provider='anthropic', model='claude-sonnet-5', user=self.user,
+            delegation_depth=MAX_DELEGATION_DEPTH,
+        ))
+
+        tool_names = [t['name'] for t in mock_run_loop.call_args.args[4]]
+        self.assertNotIn('delegate_to_agent', tool_names)
 
 
 class SendChatMessageProviderCleanupTest(TransactionTestCase):
