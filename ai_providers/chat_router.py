@@ -31,11 +31,17 @@ class AgentTool:
 
     confirmation_label overrides the generic "the '<name>' tool call" phrase
     _require_confirmation uses — set it when a more natural phrase exists
-    (e.g. delegate_to_model uses "this delegation")."""
+    (e.g. delegate_to_model uses "this delegation").
+
+    source is human-facing only (which MCP server owns this tool, or
+    "built-in") — surfaced up to the confirmation UI so a user approving a
+    call can tell a project's own search apart from a third-party MCP
+    server with real privileges. Never sent to the model."""
     schema: dict
     executor: Callable[[dict], Awaitable[str]]
     requires_confirmation: bool = False
     confirmation_label: str | None = None
+    source: str = "built-in"
 
 
 def _build_system_prompt(base: str, memories: list[str]) -> str:
@@ -101,6 +107,7 @@ async def _get_mcp_context(project_id) -> dict[str, AgentTool]:
 
             registry[tool["name"]] = AgentTool(
                 schema=tool, executor=make_executor(), requires_confirmation=server.requires_confirmation,
+                source=server.name,
             )
 
     return registry
@@ -231,7 +238,9 @@ DELEGATE_TOOL = {
 }
 
 
-async def _require_confirmation(what: str, tool_name: str, arguments: dict, confirm_tool_call) -> str | None:
+async def _require_confirmation(
+    what: str, tool_name: str, arguments: dict, confirm_tool_call, source: str,
+) -> str | None:
     """Shared human-in-the-loop gate, agnostic to which tool is asking —
     delegate_to_model and every MCP tool (see _build_delegate_tool,
     _get_mcp_context) route through this rather than each hand-rolling their
@@ -242,14 +251,17 @@ async def _require_confirmation(what: str, tool_name: str, arguments: dict, conf
 
     `what` is a noun phrase used mid-sentence, e.g. "this delegation" or
     "the 'run_query' tool call". Returns a message to short-circuit the
-    tool call with, or None to proceed.
+    tool call with, or None to proceed. `source` (AgentTool.source) rides
+    along to confirm_tool_call purely so the human on the other end of the
+    confirmation can see which MCP server owns the call — never used in the
+    text sent back to the model.
     """
     if confirm_tool_call is None:
         return (
             f"Running {what} requires interactive user confirmation, which isn't available in "
             "this context. Continue the conversation yourself, or ask what they'd like instead."
         )
-    confirmed = await confirm_tool_call(tool_name, arguments)
+    confirmed = await confirm_tool_call(tool_name, arguments, source)
     if not confirmed:
         return f"The user declined {what}. Continue the conversation yourself, or ask what they'd like instead."
     return None
@@ -269,7 +281,7 @@ def _build_combined_executor(registry: dict[str, AgentTool], confirm_tool_call) 
             raise ValueError(f"Unknown tool: {name}")
         if tool.requires_confirmation:
             what = tool.confirmation_label or f"the '{name}' tool call"
-            declined = await _require_confirmation(what, name, arguments, confirm_tool_call)
+            declined = await _require_confirmation(what, name, arguments, confirm_tool_call, tool.source)
             if declined is not None:
                 return declined
         return await tool.executor(arguments)

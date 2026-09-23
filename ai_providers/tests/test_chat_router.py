@@ -195,6 +195,7 @@ class GetMcpContextTest(TransactionTestCase):
         registry = run(_get_mcp_context(self.project.id))
 
         self.assertTrue(registry['search'].requires_confirmation)
+        self.assertEqual(registry['search'].source, 'Mine')
 
     @patch('mcp_client.services.get_tools_from_server', new_callable=AsyncMock, side_effect=ValueError('unreachable'))
     def test_survives_unreachable_server(self, mock_get_tools):
@@ -232,11 +233,11 @@ class BuildCombinedExecutorTest(TransactionTestCase):
     MCP — gets dispatched and, if flagged, gated on human confirmation. This
     exercises that gate generically, independent of any specific tool."""
 
-    def _tool(self, requires_confirmation=False, label=None, result='ok'):
+    def _tool(self, requires_confirmation=False, label=None, result='ok', source='built-in'):
         executor = AsyncMock(return_value=result)
         return executor, AgentTool(
             schema={'name': 'thing'}, executor=executor,
-            requires_confirmation=requires_confirmation, confirmation_label=label,
+            requires_confirmation=requires_confirmation, confirmation_label=label, source=source,
         )
 
     def test_dispatches_to_the_matching_tool(self):
@@ -279,8 +280,20 @@ class BuildCombinedExecutorTest(TransactionTestCase):
         result = run(combined('thing', {'q': 'x'}))
 
         self.assertIn('declined', result)
-        confirm_tool_call.assert_awaited_once_with('thing', {'q': 'x'})
+        confirm_tool_call.assert_awaited_once_with('thing', {'q': 'x'}, 'built-in')
         executor.assert_not_awaited()
+
+    def test_confirm_tool_call_receives_the_tools_source(self):
+        # source is how the human deciding a confirmation can tell a
+        # project's own MCP server apart from "built-in" -- must reach
+        # confirm_tool_call unchanged, not just live on the AgentTool.
+        executor, tool = self._tool(requires_confirmation=True, source='my-sql-server')
+        confirm_tool_call = AsyncMock(return_value=True)
+        combined = _build_combined_executor({'thing': tool}, confirm_tool_call)
+
+        run(combined('thing', {'q': 'x'}))
+
+        confirm_tool_call.assert_awaited_once_with('thing', {'q': 'x'}, 'my-sql-server')
 
     def test_sensitive_tool_confirmed(self):
         executor, tool = self._tool(requires_confirmation=True)
