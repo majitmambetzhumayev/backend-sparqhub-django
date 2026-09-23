@@ -203,6 +203,8 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                 "status": "confirm_required",
                 "tool": pending.tool,
                 "arguments": pending.arguments,
+                "source": pending.source,
+                "after_file_read": pending.after_file_read,
                 "thread_id": thread_id,
                 "user_text": user_text,
                 "streamed_text": streamed_text,
@@ -384,6 +386,8 @@ class ConversationConsumer(AsyncWebsocketConsumer):
             "status": "confirm_required",
             "tool": event["tool"],
             "arguments": event["arguments"],
+            "source": event["source"],
+            "after_file_read": event["after_file_read"],
             "thread_id": event["thread_id"],
         })
 

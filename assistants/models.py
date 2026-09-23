@@ -26,6 +26,10 @@ class Assistant(models.Model):
     ai_provider = models.CharField(max_length=50, choices=AI_PROVIDER_CHOICES, default='anthropic')
     is_persistent = models.BooleanField(default=False)
     supports_crud = models.BooleanField(default=False)
+    role = models.CharField(
+        max_length=255, blank=True,
+        help_text="Short specialty label used for multi-agent delegation matching, e.g. 'accounting', 'customer communication'.",
+    )
 
     class Meta:
         constraints = [

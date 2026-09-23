@@ -1,10 +1,12 @@
 # SparqHub backend — multi-agent orchestration (design)
 
-**Status: design decision only, nothing here is implemented yet.** This
-records the shape agreed on 2026-09-09 so building it later doesn't start
-from a blank page — see `REVIEW.md`'s Model delegation section and
-`CLAUDE.md`'s tool-registry section for the current, actually-shipped
-starting point this builds on.
+**Status: first slice implemented (2026-09-23).** The shape agreed on
+2026-09-09 is now partially real — see `REVIEW.md`'s "Multi-agent
+orchestration (`delegate_to_agent`)" section for what's actually shipped
+and verified. `Team`/pod grouping is still design-only, deferred as planned
+(see "Concrete implication for the data model" below). See `REVIEW.md`'s
+Model delegation section and `CLAUDE.md`'s tool-registry section for the
+pre-existing starting point this builds on.
 
 ## Where this comes from
 
@@ -63,25 +65,27 @@ needs to know whether it delegated to a single agent or an entire team.
 
 ## Concrete implication for the data model (when this gets built, not now)
 
-- `Assistant` needs a `role`/`specialty` field so the supervisor has
-  something to match against. Cheap to add now even before the rest
-  exists; expensive to retrofit once delegation logic is written assuming
-  a flat hardcoded list.
-- A `Team`/pod grouping concept is the part to actually defer — don't
-  build it speculatively. The point of the design above is that adding it
-  later doesn't require restructuring the delegation interface, only
-  introducing a new kind of node.
+- ✅ **Done**: `Assistant.role` (`assistants/models.py`) — a blank-by-default
+  `CharField` the supervisor matches a task against. Only assistants with a
+  non-blank role are valid delegation targets.
+- A `Team`/pod grouping concept is still the part to defer — don't build it
+  speculatively. The point of the design above is that adding it later
+  doesn't require restructuring the delegation interface (`delegate_to_agent`,
+  `ai_providers/chat_router.py`), only introducing a new kind of node.
 
 ## Open questions to resolve during implementation, not now
 
-- **Recursion depth limit** — `agent_loop.py` already bounds flat tool-call
-  rounds via `MAX_TOOL_ITERATIONS`; nested pod delegation needs an
-  equivalent bound so a misconfigured pod hierarchy can't recurse
-  indefinitely.
-- **Cost/credit attribution through nested delegation** — `deduct_credits`
-  currently prices one turn; a request that fans out through several
-  nested pods needs its cost rolled up correctly, not lost or
-  double-counted.
+- ✅ **Recursion depth limit — resolved.** `MAX_DELEGATION_DEPTH = 3` in
+  `ai_providers/chat_router.py`, enforced at `send_chat_message`'s call
+  site: past that depth, `delegate_to_agent` simply isn't offered in the
+  tool registry. Mirrors `agent_loop.py`'s `MAX_TOOL_ITERATIONS`, but bounds
+  agent-to-agent hops rather than tool-call rounds within one agent.
+- ✅ **Cost/credit attribution through nested delegation — resolved.** Each
+  level's own `deduct_credits` call fires independently when its own
+  `send_chat_message` resolves (same pattern `delegate_to_model` already
+  used for one hop) — this rolls up correctly through N levels with nothing
+  lost or double-counted. Verified with tests in
+  `ai_providers/tests/test_chat_router.py`, not just asserted.
 - **LangGraph vs. hand-rolled** — still an explicitly deferred decision
   (see `CLAUDE.md`), but pods map directly onto LangGraph's *subgraphs*
   (a compiled graph embeddable as a single node in a parent graph) more
@@ -97,6 +101,13 @@ needs to know whether it delegated to a single agent or an entire team.
   already cover those too (it's turn-level, not tied to any specific
   sub-state), but confirm that holds once pods actually exist rather than
   assuming it.
+  ✅ Confirmed for `delegate_to_agent`: its executor runs synchronously
+  within the outer turn's own async call stack (same task the top-level
+  `PendingTurn` row already spans), no new DB row or task is created per
+  delegation hop — so a crash mid-delegation is already covered by the
+  existing turn-level record. Still worth re-confirming once actual pods
+  (not just agent-to-agent hops) exist, since a pod could plausibly
+  introduce its own async boundary.
 
 ## How to apply
 

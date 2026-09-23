@@ -21,6 +21,8 @@ class _PendingConfirmation:
     future: asyncio.Future
     tool: str
     arguments: dict
+    source: str
+    after_file_read: bool
 
 
 @dataclass
@@ -89,10 +91,14 @@ def get_task(thread_id: int) -> asyncio.Task | None:
     return gen.task if gen is not None else None
 
 
-def set_pending_confirmation(thread_id: int, future: asyncio.Future, tool: str, arguments: dict) -> None:
+def set_pending_confirmation(
+    thread_id: int, future: asyncio.Future, tool: str, arguments: dict, source: str, after_file_read: bool,
+) -> None:
     gen = _active.get(thread_id)
     if gen is not None:
-        gen.pending_confirmation = _PendingConfirmation(future=future, tool=tool, arguments=arguments)
+        gen.pending_confirmation = _PendingConfirmation(
+            future=future, tool=tool, arguments=arguments, source=source, after_file_read=after_file_read,
+        )
 
 
 def clear_pending_confirmation(thread_id: int) -> None:

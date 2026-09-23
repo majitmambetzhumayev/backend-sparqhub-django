@@ -5,7 +5,9 @@ OpenAI, Mistral, Gemini), BYOK + credit metering, per-project MCP tools,
 image generation, long-term memory. See `REVIEW.md` for what's actually been
 verified vs. known gaps — keep that file updated as gaps close, don't
 replace it wholesale. See `ORCHESTRATION.md` for the multi-agent
-orchestration design (supervisor pattern, not implemented yet).
+orchestration design (supervisor pattern) — first slice (`delegate_to_agent`,
+role-based delegation between agents) is implemented; `Team`/pod grouping
+is still deferred.
 
 ## Code philosophy
 

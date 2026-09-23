@@ -7,7 +7,7 @@ from django.db import transaction
 from django.db.models import Sum
 
 from ai_providers.chat_router import (
-    InsufficientCreditsError, send_chat_message, deduct_credits, compute_turn_cost_usd,
+    FILE_SEARCH_TOOL, InsufficientCreditsError, send_chat_message, deduct_credits, compute_turn_cost_usd,
 )
 from chat_messages.models import Message, PendingTurn
 from librarian.tasks import extract_memories_task
@@ -164,15 +164,25 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
             {"type": "chat.status", "status": "delegating", "provider": provider_label, "thread_id": thread.id},
         )
 
-    async def confirm_tool_call(tool_name, arguments):
+    async def confirm_tool_call(tool_name, arguments, source="built-in"):
         future = asyncio.get_event_loop().create_future()
+        # search_project_files feeds attacker-controllable document text
+        # into the model's context (see chat_router.py's _get_mcp_context
+        # docstring) -- a sensitive tool call proposed later in the same
+        # turn may have been shaped by that content, not by anything the
+        # user actually asked for. tool_calls already records call order
+        # (track_tool_call appends before any executor runs), so this is
+        # just a membership check, no new state needed.
+        after_file_read = FILE_SEARCH_TOOL["name"] in tool_calls
         # tool/arguments stored alongside the future (not just the future
         # itself) so a client that (re)joins after this broadcast already
         # went out — e.g. reconnecting after the connection that would have
         # seen it dropped — can be sent the same confirm_required prompt
         # again via _join_thread, instead of only a generic "resuming" they
         # have no way to act on.
-        generation_registry.set_pending_confirmation(thread.id, future, tool_name, arguments)
+        generation_registry.set_pending_confirmation(
+            thread.id, future, tool_name, arguments, source, after_file_read,
+        )
         # No separate DB write here -- the PendingTurn row created at the
         # top of run_and_broadcast_turn already spans this whole window
         # (and the rest of the turn besides), so it covers a crash during
@@ -182,7 +192,10 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         # delivers an id) can still reply with the right thread_id.
         await channel_layer.group_send(
             group_name,
-            {"type": "chat.confirm_required", "tool": tool_name, "arguments": arguments, "thread_id": thread.id},
+            {
+                "type": "chat.confirm_required", "tool": tool_name, "arguments": arguments,
+                "source": source, "after_file_read": after_file_read, "thread_id": thread.id,
+            },
         )
         try:
             return await asyncio.wait_for(future, timeout=CONFIRMATION_TIMEOUT_SECONDS)

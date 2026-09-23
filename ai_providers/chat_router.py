@@ -15,6 +15,14 @@ logger = logging.getLogger(__name__)
 
 CREDIT_VALUE_USD = 0.01
 
+# Bounds nested delegate_to_agent chains (supervisor -> specialist ->
+# specialist's specialist) so a misconfigured role graph can't recurse
+# indefinitely — see ORCHESTRATION.md's "Recursion depth limit" open
+# question. Mirrors agent_loop.py's MAX_TOOL_ITERATIONS, but for
+# agent-to-agent hops rather than tool-call rounds within one agent.
+MAX_DELEGATION_DEPTH = 3
+DELEGATE_TO_AGENT_TOOL_NAME = "delegate_to_agent"
+
 
 class InsufficientCreditsError(Exception):
     pass
@@ -31,11 +39,17 @@ class AgentTool:
 
     confirmation_label overrides the generic "the '<name>' tool call" phrase
     _require_confirmation uses — set it when a more natural phrase exists
-    (e.g. delegate_to_model uses "this delegation")."""
+    (e.g. delegate_to_model uses "this delegation").
+
+    source is human-facing only (which MCP server owns this tool, or
+    "built-in") — surfaced up to the confirmation UI so a user approving a
+    call can tell a project's own search apart from a third-party MCP
+    server with real privileges. Never sent to the model."""
     schema: dict
     executor: Callable[[dict], Awaitable[str]]
     requires_confirmation: bool = False
     confirmation_label: str | None = None
+    source: str = "built-in"
 
 
 def _build_system_prompt(base: str, memories: list[str]) -> str:
@@ -101,6 +115,7 @@ async def _get_mcp_context(project_id) -> dict[str, AgentTool]:
 
             registry[tool["name"]] = AgentTool(
                 schema=tool, executor=make_executor(), requires_confirmation=server.requires_confirmation,
+                source=server.name,
             )
 
     return registry
@@ -231,7 +246,9 @@ DELEGATE_TOOL = {
 }
 
 
-async def _require_confirmation(what: str, tool_name: str, arguments: dict, confirm_tool_call) -> str | None:
+async def _require_confirmation(
+    what: str, tool_name: str, arguments: dict, confirm_tool_call, source: str,
+) -> str | None:
     """Shared human-in-the-loop gate, agnostic to which tool is asking —
     delegate_to_model and every MCP tool (see _build_delegate_tool,
     _get_mcp_context) route through this rather than each hand-rolling their
@@ -242,14 +259,17 @@ async def _require_confirmation(what: str, tool_name: str, arguments: dict, conf
 
     `what` is a noun phrase used mid-sentence, e.g. "this delegation" or
     "the 'run_query' tool call". Returns a message to short-circuit the
-    tool call with, or None to proceed.
+    tool call with, or None to proceed. `source` (AgentTool.source) rides
+    along to confirm_tool_call purely so the human on the other end of the
+    confirmation can see which MCP server owns the call — never used in the
+    text sent back to the model.
     """
     if confirm_tool_call is None:
         return (
             f"Running {what} requires interactive user confirmation, which isn't available in "
             "this context. Continue the conversation yourself, or ask what they'd like instead."
         )
-    confirmed = await confirm_tool_call(tool_name, arguments)
+    confirmed = await confirm_tool_call(tool_name, arguments, source)
     if not confirmed:
         return f"The user declined {what}. Continue the conversation yourself, or ask what they'd like instead."
     return None
@@ -269,7 +289,7 @@ def _build_combined_executor(registry: dict[str, AgentTool], confirm_tool_call) 
             raise ValueError(f"Unknown tool: {name}")
         if tool.requires_confirmation:
             what = tool.confirmation_label or f"the '{name}' tool call"
-            declined = await _require_confirmation(what, name, arguments, confirm_tool_call)
+            declined = await _require_confirmation(what, name, arguments, confirm_tool_call, tool.source)
             if declined is not None:
                 return declined
         return await tool.executor(arguments)
@@ -334,6 +354,105 @@ def _build_delegate_tool(user, on_tool_call=None, on_delegate_start=None) -> Age
 
     return AgentTool(
         schema=DELEGATE_TOOL, executor=executor, requires_confirmation=True, confirmation_label="this delegation",
+    )
+
+
+async def _build_delegate_to_agent_tool(
+    user, current_assistant, delegation_depth, *, project_id, on_tool_call, on_delegate_start, confirm_tool_call,
+) -> "AgentTool | None":
+    """Generalizes _build_delegate_tool from "delegate to a different
+    provider" to "delegate to a different agent, matched by role" — the
+    core primitive from ORCHESTRATION.md (a node is role + context +
+    executor). Returns None when the user has no other assistant with a
+    declared role, same "don't offer a guaranteed-useless tool" reasoning
+    as _build_file_search_tool.
+
+    Role-matching itself isn't a separate step: the schema description
+    lists every candidate's name/role and the calling model picks an
+    agent_id directly, the same way it already picks a provider for
+    delegate_to_model.
+
+    Two deliberate differences from _build_delegate_tool, since the target
+    here is a real, user-configured Assistant rather than a bare stub:
+    - confirm_tool_call IS threaded through the recursive send_chat_message
+      call. delegate_to_model's stub sub-assistant has no project/MCP
+      access, so a missing confirmation channel never mattered there; a
+      delegated Assistant can have MCP tools with requires_confirmation=True,
+      and without this they'd silently fail-closed instead of actually
+      pausing for the user via the existing WS confirmation flow.
+    - delegation_depth + 1 is passed down, and send_chat_message stops
+      offering this tool at all once MAX_DELEGATION_DEPTH is reached (see
+      its call site below) — bounds the recursion this tool itself creates.
+
+    No conversation_history is passed to the recursive call, matching
+    ORCHESTRATION.md: "context... scoped to that node specifically rather
+    than inherited wholesale from the outer conversation.\""""
+    from assistants.models import Assistant
+
+    def _fetch_candidates():
+        return list(
+            Assistant.objects.filter(user=user, deleted=False)
+            .exclude(pk=current_assistant.pk)
+            .exclude(role='')
+            .order_by('id')
+        )
+
+    candidates = await sync_to_async(_fetch_candidates)()
+    if not candidates:
+        return None
+
+    by_id = {a.id: a for a in candidates}
+    schema = {
+        "name": DELEGATE_TO_AGENT_TOOL_NAME,
+        "description": (
+            "Delegate this request to one of your own specialized agents when its declared role "
+            "matches the task better than you do. Requires user confirmation before running. The "
+            "chosen agent's response is shown to the user and folded into this conversation — you "
+            "remain the active agent for the rest of the conversation afterward.\n\nAvailable agents:\n"
+            + "\n".join(f"- id={a.id}: {a.name} (role: {a.role})" for a in candidates)
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "integer",
+                    "description": "id of the target agent, from the list in this tool's description.",
+                    "enum": list(by_id.keys()),
+                },
+                "prompt": {"type": "string", "description": "The task/prompt to send to the other agent."},
+                "reason": {"type": "string", "description": "Briefly explain why this agent's role fits better."},
+            },
+            "required": ["agent_id", "prompt", "reason"],
+        },
+    }
+
+    async def executor(arguments: dict) -> str:
+        target = by_id.get(arguments.get("agent_id"))
+        if target is None:
+            return f"Unknown agent id {arguments.get('agent_id')!r}. Cannot delegate."
+        prompt = arguments.get("prompt", "")
+
+        if on_delegate_start is not None:
+            await on_delegate_start(target.name)
+
+        try:
+            sub_result, sub_usage, sub_used_global_key = await send_chat_message(
+                target, prompt, ai_provider=target.ai_provider, model=target.model, user=user,
+                stream=False, project_id=project_id, on_tool_call=on_tool_call,
+                confirm_tool_call=confirm_tool_call, on_delegate_start=on_delegate_start,
+                delegation_depth=delegation_depth + 1,
+            )
+        except Exception as exc:
+            logger.exception("Delegated call to agent %s (%s) failed", target.id, target.name)
+            return f"Delegation to agent '{target.name}' failed: {exc}"
+
+        if sub_used_global_key:
+            await deduct_credits(user, target.ai_provider, target.model, sub_usage)
+
+        return f"[Response from agent '{target.name}']\n\n{sub_result}"
+
+    return AgentTool(
+        schema=schema, executor=executor, requires_confirmation=True, confirmation_label="this agent delegation",
     )
 
 
@@ -437,6 +556,7 @@ async def send_chat_message(
     confirm_tool_call=None,
     on_delegate_start=None,
     allow_delegation: bool = True,
+    delegation_depth: int = 0,
 ):
     from keys.services import get_user_api_key
 
@@ -478,6 +598,14 @@ async def send_chat_message(
                 registry[DELEGATE_TOOL["name"]] = _build_delegate_tool(
                     user, on_tool_call=on_tool_call, on_delegate_start=on_delegate_start,
                 )
+                if delegation_depth < MAX_DELEGATION_DEPTH:
+                    agent_delegate_tool = await _build_delegate_to_agent_tool(
+                        user, assistant, delegation_depth, project_id=project_id,
+                        on_tool_call=on_tool_call, on_delegate_start=on_delegate_start,
+                        confirm_tool_call=confirm_tool_call,
+                    )
+                    if agent_delegate_tool is not None:
+                        registry[DELEGATE_TO_AGENT_TOOL_NAME] = agent_delegate_tool
 
             tools = [tool.schema for tool in registry.values()]
             tool_executor = _build_combined_executor(registry, confirm_tool_call) if tools else None

@@ -1069,12 +1069,58 @@ class ConversationConsumerTest(TransactionTestCase):
         self.assertEqual(resurfaced_frame["status"], "confirm_required")
         self.assertEqual(resurfaced_frame["tool"], "delegate_to_model")
         self.assertEqual(resurfaced_frame["arguments"], {"provider": "gemini"})
+        # delegate_to_model is built-in and nothing read a file this turn --
+        # both fields must resurface unchanged for a reconnecting client.
+        self.assertEqual(resurfaced_frame["source"], "built-in")
+        self.assertFalse(resurfaced_frame["after_file_read"])
         # No chunks streamed yet at this point (confirm_tool_call is awaited
         # before the fake yields anything) — user_text is resurfaced, but
         # streamed_text is still empty.
         self.assertEqual(resurfaced_frame["user_text"], "Hi")
         self.assertEqual(resurfaced_frame["streamed_text"], "")
         self.assertEqual(first_chunk, {"chunk": "Confirmed!", "thread_id": self.existing_thread.id})
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
+    def test_confirm_required_flags_after_file_read_when_search_ran_first(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # after_file_read must be True only when search_project_files
+        # already ran earlier in the same turn -- this is the signal the
+        # confirmation UI uses to flag a call that may have been shaped by
+        # content read from an uploaded file, not by anything the user
+        # actually asked for.
+        async def fake_send_chat_message(*args, **kwargs):
+            await kwargs["on_tool_call"]("search_project_files")
+            confirmed = await kwargs["confirm_tool_call"]("run_query", {"sql": "select 1"}, "My SQL Server")
+
+            async def fake_chunks():
+                yield "Confirmed!" if confirmed else "Declined."
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            await communicator.receive_json_from()  # thinking
+            await communicator.receive_json_from()  # tool_call (search_project_files)
+            confirm_frame = await communicator.receive_json_from()  # confirm_required
+
+            await communicator.disconnect()
+            return confirm_frame
+
+        confirm_frame = run(scenario())
+        self.assertEqual(confirm_frame["tool"], "run_query")
+        self.assertEqual(confirm_frame["source"], "My SQL Server")
+        self.assertTrue(confirm_frame["after_file_read"])
 
     @patch("chat_messages.services.generate_thread_title_task")
     @patch("chat_messages.services.extract_memories_task")

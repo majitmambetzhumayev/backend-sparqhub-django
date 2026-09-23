@@ -11,6 +11,7 @@ class AssistantSerializer(serializers.ModelSerializer):
             'name',
             'instructions',
             'model',
+            'role',
             'metadata',
             'ai_provider',
             'created_at',
