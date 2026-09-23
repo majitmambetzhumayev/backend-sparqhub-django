@@ -230,10 +230,14 @@ declared `role` (e.g. "accounting"), recursively.
   a `role='accounting'` assistant via the ORM, confirmed the serializer
   round-trips `role`, and confirmed `_build_delegate_to_agent_tool` offers
   `delegate_to_agent` with the right schema against real query results.
-- ⏳ Not yet live-verified over the real WebSocket with an actual LLM call
-  choosing to delegate and a user confirming in the UI (the `delegate_to_model`
-  section above has that full pass; this doesn't yet) — do this before
-  considering the feature done, not just unit/DB-tested.
+- ✅ Live-verified end-to-end over the real WebSocket (2026-09-23): two
+  assistants created via the UI (one with `role='accounting'`), a real
+  finance-flavored question against the generalist, model chose to call
+  `delegate_to_agent`, confirmation card appeared, confirmed, specialist's
+  response folded back into the conversation.
+- ⚠️ First working version, not polished: the assistant-manager page (where
+  `role` is set) has no nav link anywhere in the app — reachable only by
+  typing the URL directly. See the frontend gap below.
 - Out of scope for this slice, by design: no `Team`/pod grouping concept
   (`ORCHESTRATION.md` explicitly defers it — adding it later doesn't
   require restructuring this delegation interface). LangGraph vs.
