@@ -208,6 +208,20 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                 # the resuming indicator for this exact shape, so the normal
                 # chat.status/chat.chunk frames the newly spawned task emits
                 # take over seamlessly, no frontend changes needed.
+                #
+                # Same rate limit as every other turn-start path (receive()'s
+                # own check before _start_generation) -- this still triggers
+                # a real provider call against the same shared budget, even
+                # though the user isn't the one directly initiating it.
+                if not check_rate_limit(f"ratelimit:chat:{user.id}", settings.CHAT_MESSAGES_PER_MINUTE, 60):
+                    await self._safe_send({
+                        "error": (
+                            "Your previous request was interrupted before it could complete. "
+                            "Please send it again."
+                        ),
+                        "thread_id": thread_id,
+                    })
+                    return
                 if not generation_registry.try_claim(thread_id):
                     # Vanishingly unlikely (nothing else could have claimed
                     # it between is_active() being False above and here) --
@@ -373,13 +387,13 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         uncancellable-by-disconnect as two would be (nothing cancels
         either), and it's what a future cancel/"stop generation" feature
         would target."""
-        generation_registry.attach_task(thread.id, asyncio.current_task())
-        generation_registry.set_turn_text(thread.id, message_text)
-
-        await self.channel_layer.group_add(group_name, self.channel_name)
-        self._joined_groups.add(group_name)
-
         try:
+            generation_registry.attach_task(thread.id, asyncio.current_task())
+            generation_registry.set_turn_text(thread.id, message_text)
+
+            await self.channel_layer.group_add(group_name, self.channel_name)
+            self._joined_groups.add(group_name)
+
             try:
                 memories = await sync_to_async(retrieve_relevant_memories)(user, message_text)
             except Exception:
@@ -397,13 +411,17 @@ class ConversationConsumer(AsyncWebsocketConsumer):
 
             await run_and_broadcast_turn(thread, message_text, user, group_name, memories=memories)
         except Exception:
-            # Anything else unexpected between claiming the thread and
-            # handing off to run_and_broadcast_turn (whose own try/finally
-            # already covers itself once it starts) must not die silently
-            # inside this un-awaited task — that previously left
-            # generation_registry's claim leaked forever with no chat.error
-            # ever reaching the client (e.g. a transient Redis blip on
-            # group_add, previously uncaught here).
+            # Covers everything from the registry registration/group_add
+            # setup above through run_and_broadcast_turn's own handoff
+            # (whose own try/finally already covers itself once it starts)
+            # — e.g. a transient Redis blip on group_add. Must not die
+            # silently inside this un-awaited task (both call sites use
+            # asyncio.create_task, never awaited by anything): that would
+            # leak generation_registry's claim forever with no chat.error
+            # ever reaching the client. Always releases thread.id, the one
+            # key this whole method operates under regardless of which
+            # caller spawned it — no separate "which id did we actually
+            # claim" bookkeeping needed here.
             logger.exception("Unexpected failure in _run_turn_task for thread %s", thread.id)
             generation_registry.release(thread.id)
             await self._safe_send({"error": "Something went wrong while starting the response. Please try again."})

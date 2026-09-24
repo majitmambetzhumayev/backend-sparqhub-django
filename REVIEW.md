@@ -170,7 +170,11 @@ scenario not covered by the current fix.
   deferred undertaking. What shipped instead is a safe *whole-turn* replay
   for the case where nothing could have gone wrong yet, not a general
   fix — the tool-proposed case is intentionally left exactly as
-  conservative as before.
+  conservative as before. This is a deliberate, narrow exception to the
+  earlier "don't extend `PendingTurn`, replace it" guardrail (`CLAUDE.md`
+  explains the distinction) — not a quiet reversal of it: the constraint
+  was about not building exact-point resume piecemeal, and whole-turn
+  replay gated on one conservative boolean doesn't do that.
 - ✅ **Multi-agent orchestration has started** — see the dedicated section
   below (`delegate_to_agent`). `delegate_to_model` (a manual, one-shot
   provider escalation) was the only "agentic" mechanism before that.

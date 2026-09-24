@@ -98,6 +98,17 @@ could trigger a spurious auto-replay on top of an already-completed turn.
 only covered the tool-confirmation-wait window — generalized once it was
 clear a crash during plain streaming left no signal at all.)
 
+**This is a deliberate, narrow exception to "don't treat `PendingTurn` as a
+design to extend,"** not a quiet reversal of it — the constraint that
+mattered was never touching this model, it was not building *exact-point*
+resume piecemeal on top of it (still true: no mid-tool-loop state is
+reconstructed here). Whole-turn replay, gated on a single conservative
+boolean signal, doesn't grow toward that in the way the original rule was
+guarding against. If a future change starts reconstructing partial
+tool-loop state on `PendingTurn` rather than just deciding "replay from
+scratch or don't," that's the real fix arriving piecemeal — stop and build
+the checkpointer instead.
+
 Multi-agent orchestration is a real direction for this product, but
 whether that eventually justifies adopting something like LangGraph is an
 explicit, deferred decision — don't assume either way.

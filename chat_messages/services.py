@@ -24,7 +24,10 @@ logger = logging.getLogger(__name__)
 CONFIRMATION_TIMEOUT_SECONDS = 300
 
 
-def _record_turn(thread, history, user_text, assistant_text, tool_calls=None, usage=None, used_global_key=True):
+def _record_turn(
+    thread, history, user_text, assistant_text, tool_calls=None, usage=None, used_global_key=True,
+    pending_turn_id=None,
+):
     # BYOK spend isn't deducted from credits at all (see the used_global_key
     # gate in send_message/run_and_broadcast_turn below), so it's the one
     # case where this turn's real USD cost needs computing here instead of
@@ -69,19 +72,27 @@ def _record_turn(thread, history, user_text, assistant_text, tool_calls=None, us
         thread.title = locked_thread.title
         generate_thread_title_task.delay(thread.id, user_text[:500], assistant_text[:500])
     extract_memories_task.delay(thread.user_id, thread.assistant_id, user_text, assistant_text)
-    # Deleted here, not left to run_and_broadcast_turn's outer `finally`,
-    # so there's no await between "Messages persisted" and "PendingTurn
-    # gone" -- the outer finally's own deletion still runs afterward as a
-    # no-op, and stays the only cleanup for paths that never reach this
-    # function at all (InsufficientCreditsError, a bare Exception). Closes
-    # a real gap: PendingTurn.__doc__ claims "nothing is written to Message
-    # until the whole turn completes", but a crash during the previously-later
-    # await _deduct_credits_after_persisted_turn (after this function returns)
-    # left the row alive despite the turn's content already being safely
-    # saved -- harmless before this feature (just an unneeded "please
-    # resend"), actively dangerous once a stale row can trigger an
-    # automatic replay (see ConversationConsumer._join_thread).
-    PendingTurn.objects.filter(thread_id=thread.id).delete()
+    # Deleted here (by its own pk, not by thread_id), not left to
+    # run_and_broadcast_turn's outer `finally`, so there's no await between
+    # "Messages persisted" and "PendingTurn gone" -- the outer finally's own
+    # deletion still runs afterward as a no-op, and stays the only cleanup
+    # for paths that never reach this function at all (InsufficientCreditsError,
+    # a bare Exception). Closes a real gap: PendingTurn.__doc__ claims
+    # "nothing is written to Message until the whole turn completes", but a
+    # crash during the previously-later await _deduct_credits_after_persisted_turn
+    # (after this function returns) left the row alive despite the turn's
+    # content already being safely saved -- harmless before this feature
+    # (just an unneeded "please resend"), actively dangerous once a stale
+    # row can trigger an automatic replay (see ConversationConsumer._join_thread).
+    #
+    # pending_turn_id is None for send_message's HTTP path (which never
+    # creates a PendingTurn row at all -- no generation_registry claim
+    # guards it, so there's nothing of its own to clean up here). Deleting
+    # by pk rather than by thread_id matters even on the WS path: a
+    # concurrent HTTP send on the same thread must never be able to delete
+    # a still-in-flight WS turn's own row out from under it.
+    if pending_turn_id is not None:
+        PendingTurn.objects.filter(pk=pending_turn_id).delete()
 
 
 def get_usage_summary(user) -> dict:
@@ -157,8 +168,13 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
     # Durability net for the whole turn, not just the tool-confirmation-wait
     # window (see PendingTurn's docstring) -- written before anything else
     # so even a crash during the very first model call is covered. Cleared
-    # in the `finally` below regardless of how the turn ends.
-    await sync_to_async(PendingTurn.objects.create)(thread=thread, user_text=text)
+    # in the `finally` below regardless of how the turn ends. Every
+    # subsequent read/update/delete of this row is scoped to its own pk,
+    # not thread_id -- a concurrent HTTP send on the same thread (see
+    # send_message/_record_turn) must never be able to touch a WS turn's
+    # own row, and generation_registry.try_claim already guarantees at
+    # most one WS turn per thread anyway, so pk is never less precise.
+    pending_turn = await sync_to_async(PendingTurn.objects.create)(thread=thread, user_text=text)
     history = thread.conversation_state or []
     tool_calls: list[str] = []
 
@@ -169,9 +185,15 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         # ._join_thread's auto-replay decision -- on_tool_call fires before
         # a tool's confirmation gate (see AgentTool's docstring), so any
         # entry here, confirmed or not, must disqualify auto-replay.
-        await sync_to_async(PendingTurn.objects.filter(thread_id=thread.id).update)(tool_calls=tool_calls)
-        await channel_layer.group_send(
-            group_name, {"type": "chat.status", "status": "tool_call", "tool": tool_name, "thread_id": thread.id},
+        # Independent of the client-facing broadcast below (one talks to
+        # Postgres, the other to the channel layer) -- run concurrently
+        # rather than paying two round-trips back to back on a path that's
+        # already latency-sensitive for perceived responsiveness.
+        await asyncio.gather(
+            sync_to_async(PendingTurn.objects.filter(pk=pending_turn.pk).update)(tool_calls=tool_calls),
+            channel_layer.group_send(
+                group_name, {"type": "chat.status", "status": "tool_call", "tool": tool_name, "thread_id": thread.id},
+            ),
         )
 
     async def track_delegate_start(provider_label):
@@ -243,7 +265,10 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
             generation_registry.append_streamed_chunk(thread.id, chunk)
             await channel_layer.group_send(group_name, {"type": "chat.chunk", "chunk": chunk, "thread_id": thread.id})
         assistant_text = "".join(collected)
-        await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls, usage, used_global_key)
+        await sync_to_async(_record_turn)(
+            thread, history, text, assistant_text, tool_calls, usage, used_global_key,
+            pending_turn_id=pending_turn.pk,
+        )
         if used_global_key:
             await _deduct_credits_after_persisted_turn(user, thread, usage)
     except InsufficientCreditsError as exc:
@@ -260,7 +285,10 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         # state — nothing awaits it anyway (see ConversationConsumer).
         if collected:
             assistant_text = "".join(collected)
-            await sync_to_async(_record_turn)(thread, history, text, assistant_text, tool_calls, usage, used_global_key)
+            await sync_to_async(_record_turn)(
+                thread, history, text, assistant_text, tool_calls, usage, used_global_key,
+                pending_turn_id=pending_turn.pk,
+            )
             if used_global_key:
                 await _deduct_credits_after_persisted_turn(user, thread, usage)
         await channel_layer.group_send(group_name, {"type": "chat.done", "thread_id": thread.id, "stopped": True})
@@ -278,6 +306,6 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         return
     finally:
         generation_registry.release(thread.id)
-        await sync_to_async(PendingTurn.objects.filter(thread_id=thread.id).delete)()
+        await sync_to_async(PendingTurn.objects.filter(pk=pending_turn.pk).delete)()
 
     await channel_layer.group_send(group_name, {"type": "chat.done", "thread_id": thread.id})

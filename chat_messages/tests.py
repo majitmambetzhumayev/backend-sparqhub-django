@@ -1,5 +1,6 @@
 # chat_messages/tests.py
 import asyncio
+import json
 import time
 from unittest.mock import AsyncMock, patch
 
@@ -249,11 +250,25 @@ class SendMessageServiceTest(TransactionTestCase):
         # Harmless before auto-replay existed (just an unneeded "please
         # resend"); would now risk a duplicate auto-replayed turn on top of
         # an already-completed one. _record_turn must close that gap itself.
-        PendingTurn.objects.create(thread=self.thread, user_text="Hello")
+        pending_turn = PendingTurn.objects.create(thread=self.thread, user_text="Hello")
+
+        _record_turn(self.thread, [], "Hello", "Hi there!", pending_turn_id=pending_turn.pk)
+
+        self.assertEqual(PendingTurn.objects.filter(thread=self.thread).count(), 0)
+
+    def test_record_turn_leaves_other_threads_pending_turn_untouched_without_an_id(self):
+        # Regression test: _record_turn's cleanup must be scoped to a
+        # specific PendingTurn (by pk), not "whatever row exists for this
+        # thread" -- send_message's HTTP path calls _record_turn with no
+        # pending_turn_id (it never creates a row of its own, since it
+        # doesn't go through generation_registry at all), and must not
+        # delete a *different*, still-in-flight WS turn's own row on the
+        # same thread just because it happens to share a thread_id.
+        concurrent_ws_turn = PendingTurn.objects.create(thread=self.thread, user_text="From a WS turn")
 
         _record_turn(self.thread, [], "Hello", "Hi there!")
 
-        self.assertEqual(PendingTurn.objects.filter(thread=self.thread).count(), 0)
+        self.assertTrue(PendingTurn.objects.filter(pk=concurrent_ws_turn.pk).exists())
 
 
 class DeductCreditsAfterPersistedTurnTest(TransactionTestCase):
@@ -1479,6 +1494,35 @@ class ConversationConsumerTest(TransactionTestCase):
 
         consumer.channel_layer.group_discard.assert_awaited_once_with("thread_999", "test-channel-x")
         self.assertEqual(consumer._joined_groups, set())
+
+    def test_run_turn_task_releases_claim_on_setup_failure(self):
+        # Regression test: attach_task/set_turn_text/group_add used to run
+        # *before* _run_turn_task's own try block, so a failure there (e.g.
+        # a transient Redis blip on group_add) was only caught by whichever
+        # caller happened to wrap the call -- _start_generation's own except
+        # used the wrong generation_registry key for a brand-new thread (the
+        # still-None `thread_id` param, not the just-claimed `thread.id`),
+        # and _join_thread's auto-replay path had no wrapping try at all.
+        # Moving that setup inside the try means _run_turn_task's own
+        # except -- which always uses thread.id, the one key this method
+        # actually operates under -- is the single source of truth for
+        # cleanup, regardless of which caller spawned it.
+        consumer = ConversationConsumer()
+        consumer.scope = {"user": self.user}
+        consumer.channel_layer = AsyncMock()
+        consumer.channel_layer.group_add.side_effect = RuntimeError("simulated Redis blip")
+        consumer.channel_name = "test-channel-x"
+        consumer._joined_groups = set()
+        consumer.send = AsyncMock()
+
+        generation_registry.try_claim(self.existing_thread.id)
+
+        run(consumer._run_turn_task(self.existing_thread, "Hi", self.user, f"thread_{self.existing_thread.id}"))
+
+        self.assertFalse(generation_registry.is_active(self.existing_thread.id))
+        consumer.send.assert_awaited_once()
+        sent = json.loads(consumer.send.call_args.args[0])
+        self.assertIn("Something went wrong", sent["error"])
 
 
 class SendMessageAPICreditsTest(APITestCase):
