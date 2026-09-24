@@ -189,12 +189,28 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         # Postgres, the other to the channel layer) -- run concurrently
         # rather than paying two round-trips back to back on a path that's
         # already latency-sensitive for perceived responsiveness.
-        await asyncio.gather(
+        # return_exceptions=True: this write is a durability nice-to-have,
+        # not core to the turn -- letting a transient DB blip here propagate
+        # would abort the whole tool-execution loop (on_tool_call is awaited
+        # directly by agent_loop.py) over what should, at worst, degrade to
+        # a slightly-stale PendingTurn.tool_calls, same tolerance the actual
+        # tool executor's own confirmation gate already has for hiccups
+        # elsewhere in this turn.
+        pending_turn_update, broadcast = await asyncio.gather(
             sync_to_async(PendingTurn.objects.filter(pk=pending_turn.pk).update)(tool_calls=tool_calls),
             channel_layer.group_send(
                 group_name, {"type": "chat.status", "status": "tool_call", "tool": tool_name, "thread_id": thread.id},
             ),
+            return_exceptions=True,
         )
+        if isinstance(pending_turn_update, Exception):
+            logger.exception(
+                "Failed to persist tool_calls onto PendingTurn for thread %s", thread.id, exc_info=pending_turn_update,
+            )
+        if isinstance(broadcast, Exception):
+            logger.exception(
+                "Failed to broadcast tool_call status for thread %s", thread.id, exc_info=broadcast,
+            )
 
     async def track_delegate_start(provider_label):
         # The delegated call (a fresh, one-shot send_chat_message) used to

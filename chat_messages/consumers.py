@@ -183,7 +183,12 @@ class ConversationConsumer(AsyncWebsocketConsumer):
             # the client to resend it themselves.
             stale = await sync_to_async(PendingTurn.objects.filter(thread_id=thread_id).first)()
             if stale is not None:
-                await sync_to_async(PendingTurn.objects.filter(thread_id=thread_id).delete)()
+                # Scoped to stale.pk, not thread_id -- an unscoped delete
+                # could wipe a *different*, concurrently-created turn's own
+                # row (e.g. another tab's send winning a race right after
+                # this fetch) instead of just the one actually found stale.
+                # Same reasoning as _record_turn's pk-scoped deletes.
+                await sync_to_async(PendingTurn.objects.filter(pk=stale.pk).delete)()
                 if stale.tool_calls:
                     # A tool was proposed this turn -- on_tool_call fires
                     # before a tool's confirmation gate (see AgentTool's
@@ -223,9 +228,16 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                     })
                     return
                 if not generation_registry.try_claim(thread_id):
-                    # Vanishingly unlikely (nothing else could have claimed
-                    # it between is_active() being False above and here) --
-                    # defensive only, matches try_claim's use elsewhere.
+                    # Not actually rare: two tabs on the same thread both
+                    # reconnecting after a restart can both get past the
+                    # is_active() check above (there are several awaited DB
+                    # calls in between) and race here. The loser must not
+                    # return silently — by this point the winner's turn is
+                    # registered in generation_registry, so this is exactly
+                    # the "already active" case below; send the same status
+                    # a plain mid-stream rejoin would get instead of leaving
+                    # this tab with no frame at all.
+                    await self._send_active_turn_status(thread_id)
                     return
                 await self._safe_send({
                     "status": "resuming", "thread_id": thread_id,
@@ -233,11 +245,15 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                 })
                 asyncio.create_task(self._run_turn_task(thread, stale.user_text, user, group_name))
             return
+        await self._send_active_turn_status(thread_id)
+
+    async def _send_active_turn_status(self, thread_id) -> None:
         # Nothing is persisted to the DB mid-turn, so this pair is the only
         # record of what's happened so far — without it, a client that
         # (re)joins mid-stream (navigated to another thread and back while
-        # this one was still generating) would see neither the question nor
-        # the answer-so-far until the whole turn eventually finishes.
+        # this one was still generating, or lost a claim race in
+        # _join_thread just above) would see neither the question nor the
+        # answer-so-far until the whole turn eventually finishes.
         user_text, streamed_text = generation_registry.get_turn_progress(thread_id)
         pending = generation_registry.get_pending_confirmation(thread_id)
         if pending is not None:

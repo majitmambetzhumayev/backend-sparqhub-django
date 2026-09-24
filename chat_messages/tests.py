@@ -1330,6 +1330,59 @@ class ConversationConsumerTest(TransactionTestCase):
         self.assertEqual(frame["thread_id"], self.existing_thread.id)
         self.assertEqual(PendingTurn.objects.filter(thread=self.existing_thread).count(), 0)
 
+    @patch("chat_messages.consumers.generation_registry.try_claim", return_value=False)
+    def test_join_thread_loses_the_auto_replay_claim_race(self, mock_try_claim):
+        # Regression test: two tabs on the same thread reconnecting after a
+        # restart can both get past the is_active() check (several awaited
+        # DB calls happen before try_claim) and race there -- the loser must
+        # not return silently (a real prior bug), it must get the same
+        # "already active" status a plain mid-stream rejoin would.
+        PendingTurn.objects.create(thread=self.existing_thread, user_text="Hi")
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"type": "join_thread", "thread_id": self.existing_thread.id})
+            frame = await communicator.receive_json_from()
+
+            await communicator.disconnect()
+            return frame
+
+        frame = run(scenario())
+        self.assertEqual(frame["status"], "resuming")
+        self.assertEqual(frame["thread_id"], self.existing_thread.id)
+        mock_try_claim.assert_called_once_with(self.existing_thread.id)
+        # The stale row is still gone -- losing the race doesn't leave it
+        # behind for a third join to trip over.
+        self.assertEqual(PendingTurn.objects.filter(thread=self.existing_thread).count(), 0)
+
+    def test_join_thread_deletes_stale_pending_turn_by_pk_not_thread_id(self):
+        # Regression test: the stale-row delete must be scoped to the exact
+        # row found stale (by pk), not "whatever row exists for this
+        # thread" -- otherwise it can wipe a different, concurrently-created
+        # turn's own durability row. Same reasoning as _record_turn's
+        # pk-scoped deletes (see its own regression test).
+        stale = PendingTurn.objects.create(thread=self.existing_thread, user_text="Hi")
+        concurrent_turn = PendingTurn.objects.create(thread=self.existing_thread, user_text="A different turn")
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"type": "join_thread", "thread_id": self.existing_thread.id})
+            await communicator.receive_json_from()
+
+            await communicator.disconnect()
+
+        run(scenario())
+        self.assertFalse(PendingTurn.objects.filter(pk=stale.pk).exists())
+        self.assertTrue(PendingTurn.objects.filter(pk=concurrent_turn.pk).exists())
+
     def test_join_thread_with_no_pending_turn_sends_nothing(self):
         # Baseline: a plain, never-generated-on thread shouldn't get an
         # interrupted-turn error just because generation_registry is empty —
