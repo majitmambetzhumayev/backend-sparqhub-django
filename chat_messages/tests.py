@@ -241,6 +241,20 @@ class SendMessageServiceTest(TransactionTestCase):
             ],
         )
 
+    def test_record_turn_deletes_pending_turn_immediately(self):
+        # Regression test: PendingTurn used to only get cleaned up in
+        # run_and_broadcast_turn's outer `finally`, with a real await (credit
+        # deduction) in between -- a crash in that window left the row alive
+        # even though the turn's Message rows were already safely persisted.
+        # Harmless before auto-replay existed (just an unneeded "please
+        # resend"); would now risk a duplicate auto-replayed turn on top of
+        # an already-completed one. _record_turn must close that gap itself.
+        PendingTurn.objects.create(thread=self.thread, user_text="Hello")
+
+        _record_turn(self.thread, [], "Hello", "Hi there!")
+
+        self.assertEqual(PendingTurn.objects.filter(thread=self.thread).count(), 0)
+
 
 class DeductCreditsAfterPersistedTurnTest(TransactionTestCase):
     def setUp(self):
@@ -412,6 +426,48 @@ class ConversationConsumerTest(TransactionTestCase):
         thread = Thread.objects.get(pk=thread_id)
         assistant_message = Message.objects.get(thread=thread, sender="assistant")
         self.assertEqual(assistant_message.tool_calls, ["search_memories"])
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
+    def test_tool_call_is_mirrored_onto_pending_turn_row(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # track_tool_call must write onto PendingTurn.tool_calls, not just
+        # broadcast the status frame -- this is the signal _join_thread's
+        # auto-replay decision reads after a crash (see its docstring).
+        async def fake_send_chat_message(*args, **kwargs):
+            await kwargs["on_tool_call"]("search_memories")
+
+            async def fake_chunks():
+                yield "Done."
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            await communicator.receive_json_from()  # thinking
+            tool_call_frame = await communicator.receive_json_from()  # tool_call
+
+            row = await sync_to_async(PendingTurn.objects.filter(thread_id=self.existing_thread.id).first)()
+
+            await communicator.receive_json_from()  # chunk
+            await communicator.receive_json_from()  # done
+            await communicator.disconnect()
+            return tool_call_frame, row
+
+        tool_call_frame, row = run(scenario())
+        self.assertEqual(tool_call_frame["tool"], "search_memories")
+        self.assertIsNotNone(row)
+        self.assertEqual(row.tool_calls, ["search_memories"])
 
     @patch('chat_messages.services.generate_thread_title_task')
     @patch('chat_messages.services.extract_memories_task')
@@ -1179,15 +1235,67 @@ class ConversationConsumerTest(TransactionTestCase):
         self.assertEqual(row_before_confirmation.user_text, "Hi")
         self.assertEqual(rows_after_resolved, 0)
 
-    def test_join_thread_reports_interrupted_turn_after_restart(self):
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
+    def test_join_thread_auto_replays_interrupted_turn_with_no_tool_calls(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
         # Simulates reconnecting after a process restart: generation_registry
         # is empty (nothing ran in-process for this thread), but a
-        # PendingTurn row survived from before the restart — the one signal
-        # available that a turn was interrupted, since nothing else about an
-        # in-flight turn is persisted until it completes. Doesn't matter
-        # *when* in the turn the crash happened (mid-stream or mid-tool-call)
-        # -- PendingTurn spans the whole thing either way.
+        # PendingTurn row survived from before the restart with an empty
+        # tool_calls list -- nothing was ever proposed this turn, so nothing
+        # could have had a side effect. Safe to replay the whole turn
+        # automatically rather than making the user resend it themselves.
         PendingTurn.objects.create(thread=self.existing_thread, user_text="Hi")
+
+        async def fake_chunks():
+            yield "Hello again!"
+
+        async def fake_send_chat_message(*args, **kwargs):
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"type": "join_thread", "thread_id": self.existing_thread.id})
+            resuming_frame = await communicator.receive_json_from()
+            thinking_frame = await communicator.receive_json_from()
+            chunk_frame = await communicator.receive_json_from()
+            done_frame = await communicator.receive_json_from()
+
+            await communicator.disconnect()
+            return resuming_frame, thinking_frame, chunk_frame, done_frame
+
+        resuming_frame, thinking_frame, chunk_frame, done_frame = run(scenario())
+        self.assertEqual(resuming_frame["status"], "resuming")
+        self.assertEqual(resuming_frame["user_text"], "Hi")
+        self.assertEqual(resuming_frame["streamed_text"], "")
+        self.assertEqual(thinking_frame["status"], "thinking")
+        self.assertEqual(chunk_frame["chunk"], "Hello again!")
+        self.assertTrue(done_frame["done"])
+        mock_send.assert_awaited_once()
+        self.assertEqual(mock_send.call_args.args[1], "Hi")
+        self.existing_thread.refresh_from_db()
+        self.assertEqual(self.existing_thread.conversation_state[-1], {"role": "assistant", "content": "Hello again!"})
+        self.assertEqual(PendingTurn.objects.filter(thread=self.existing_thread).count(), 0)
+
+    def test_join_thread_reports_interrupted_turn_with_a_tool_call_after_restart(self):
+        # Same restart scenario, but a tool call was proposed this turn
+        # before the crash (confirmed, declined, or still pending -- can't
+        # tell which, see PendingTurn.tool_calls) -- must NOT auto-replay,
+        # since that tool call may have already had a real side effect.
+        # Falls back to the same "please check, then resend" shape as
+        # before, just with a sharper message.
+        PendingTurn.objects.create(
+            thread=self.existing_thread, user_text="Hi", tool_calls=["delegate_to_model"],
+        )
 
         async def scenario():
             communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
@@ -1203,6 +1311,7 @@ class ConversationConsumerTest(TransactionTestCase):
 
         frame = run(scenario())
         self.assertIn("interrupted", frame["error"])
+        self.assertIn("tool call", frame["error"])
         self.assertEqual(frame["thread_id"], self.existing_thread.id)
         self.assertEqual(PendingTurn.objects.filter(thread=self.existing_thread).count(), 0)
 

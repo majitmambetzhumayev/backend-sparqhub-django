@@ -69,6 +69,19 @@ def _record_turn(thread, history, user_text, assistant_text, tool_calls=None, us
         thread.title = locked_thread.title
         generate_thread_title_task.delay(thread.id, user_text[:500], assistant_text[:500])
     extract_memories_task.delay(thread.user_id, thread.assistant_id, user_text, assistant_text)
+    # Deleted here, not left to run_and_broadcast_turn's outer `finally`,
+    # so there's no await between "Messages persisted" and "PendingTurn
+    # gone" -- the outer finally's own deletion still runs afterward as a
+    # no-op, and stays the only cleanup for paths that never reach this
+    # function at all (InsufficientCreditsError, a bare Exception). Closes
+    # a real gap: PendingTurn.__doc__ claims "nothing is written to Message
+    # until the whole turn completes", but a crash during the previously-later
+    # await _deduct_credits_after_persisted_turn (after this function returns)
+    # left the row alive despite the turn's content already being safely
+    # saved -- harmless before this feature (just an unneeded "please
+    # resend"), actively dangerous once a stale row can trigger an
+    # automatic replay (see ConversationConsumer._join_thread).
+    PendingTurn.objects.filter(thread_id=thread.id).delete()
 
 
 def get_usage_summary(user) -> dict:
@@ -151,6 +164,12 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
 
     async def track_tool_call(tool_name):
         tool_calls.append(tool_name)
+        # Mirrored onto the PendingTurn row so a reconnecting client's stale
+        # row carries this turn's safety signal for ConversationConsumer
+        # ._join_thread's auto-replay decision -- on_tool_call fires before
+        # a tool's confirmation gate (see AgentTool's docstring), so any
+        # entry here, confirmed or not, must disqualify auto-replay.
+        await sync_to_async(PendingTurn.objects.filter(thread_id=thread.id).update)(tool_calls=tool_calls)
         await channel_layer.group_send(
             group_name, {"type": "chat.status", "status": "tool_call", "tool": tool_name, "thread_id": thread.id},
         )
