@@ -239,6 +239,15 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                     # this tab with no frame at all.
                     await self._send_active_turn_status(thread_id)
                     return
+                # Set synchronously, right after the claim and before any
+                # further await, so a third party racing in right behind us
+                # (another tab's _join_thread, or this same one on a
+                # subsequent call) sees the real text via get_turn_progress
+                # immediately -- not the blank default try_claim seeds
+                # _Generation with, which would otherwise be visible until
+                # _run_turn_task's own task actually gets scheduled and sets
+                # this itself moments later.
+                generation_registry.set_turn_text(thread_id, stale.user_text)
                 await self._safe_send({
                     "status": "resuming", "thread_id": thread_id,
                     "user_text": stale.user_text, "streamed_text": "",
@@ -344,6 +353,16 @@ class ConversationConsumer(AsyncWebsocketConsumer):
             return
 
         user = self.scope["user"]
+        # Tracks whichever generation_registry key is actually claimed at
+        # any point in this method, so the outer except below always
+        # releases the right one — starts as the caller's own thread_id
+        # (already claimed in receive() for an existing thread), updated to
+        # thread.id the moment a brand-new thread's own claim succeeds.
+        # _run_turn_task's own except (always thread.id, since by the time
+        # it runs `thread` is all there is) covers the realistic failure
+        # modes (e.g. a Redis blip on group_add); this is defense-in-depth
+        # for the far less likely case of that handler itself raising.
+        resolved_thread_id = thread_id
         try:
             try:
                 thread = await sync_to_async(get_or_create_thread)(
@@ -365,6 +384,7 @@ class ConversationConsumer(AsyncWebsocketConsumer):
                 # race to worry about — nothing else can reference this id
                 # before this line runs.
                 generation_registry.try_claim(thread.id)
+            resolved_thread_id = thread.id
 
             group_name = f"thread_{thread.id}"
             await self._run_turn_task(thread, message_text, user, group_name)
@@ -377,9 +397,9 @@ class ConversationConsumer(AsyncWebsocketConsumer):
             # chat.error ever reaching the client. _run_turn_task's own
             # try/except already covers everything from thread resolution
             # onward; this is the one step still outside it.
-            logger.exception("Unexpected failure in _start_generation for thread %s", thread_id)
-            if thread_id is not None:
-                generation_registry.release(thread_id)
+            logger.exception("Unexpected failure in _start_generation for thread %s", resolved_thread_id)
+            if resolved_thread_id is not None:
+                generation_registry.release(resolved_thread_id)
             await self._safe_send({"error": "Something went wrong while starting the response. Please try again."})
         finally:
             # Only this call site's own new-thread creation guard --
@@ -426,6 +446,24 @@ class ConversationConsumer(AsyncWebsocketConsumer):
             )
 
             await run_and_broadcast_turn(thread, message_text, user, group_name, memories=memories)
+        except asyncio.CancelledError:
+            # _stop_generation cancels exactly the task attach_task just
+            # registered above -- reachable the instant that line runs, well
+            # before run_and_broadcast_turn (whose own CancelledError
+            # handling only covers *its own* try, starting later) even gets
+            # called. CancelledError is BaseException, not Exception, since
+            # Python 3.8 -- needs its own branch, or a stop landing during
+            # group_add/memory-retrieval/the "thinking" broadcast would
+            # propagate uncaught and leak the claim forever, the same
+            # permanent-hang failure mode the except Exception below exists
+            # to prevent. A deliberate stop, not a failure: no error frame,
+            # just the same chat.done(stopped=True) shape
+            # run_and_broadcast_turn's own stop path sends. Nothing was ever
+            # streamed yet at this point, so there's nothing to save.
+            generation_registry.release(thread.id)
+            await self.channel_layer.group_send(
+                group_name, {"type": "chat.done", "thread_id": thread.id, "stopped": True},
+            )
         except Exception:
             # Covers everything from the registry registration/group_add
             # setup above through run_and_broadcast_turn's own handoff

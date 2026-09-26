@@ -484,6 +484,49 @@ class ConversationConsumerTest(TransactionTestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row.tool_calls, ["search_memories"])
 
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
+    @patch("chat_messages.services.PendingTurn.objects.filter")
+    def test_tool_call_pending_turn_write_failure_aborts_the_turn(
+        self, mock_filter, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # Regression test: a failed PendingTurn.tool_calls write must abort
+        # the turn, not be swallowed -- unlike the client-facing status
+        # broadcast (purely cosmetic), this write is the safety signal
+        # _join_thread's auto-replay decision reads. Silently continuing
+        # with the tool about to execute anyway, while the row still says
+        # "no tool was proposed", would make a future crash+reconnect
+        # auto-replay a turn that already had a real side effect.
+        mock_filter.return_value.update.side_effect = RuntimeError("db blip")
+
+        async def fake_send_chat_message(*args, **kwargs):
+            await kwargs["on_tool_call"]("search_memories")
+
+            async def fake_chunks():
+                yield "unreachable"
+
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            await communicator.receive_json_from()  # thinking
+            error_frame = await communicator.receive_json_from()
+
+            await communicator.disconnect()
+            return error_frame
+
+        error_frame = run(scenario())
+        self.assertIn("error", error_frame)
+
     @patch('chat_messages.services.generate_thread_title_task')
     @patch('chat_messages.services.extract_memories_task')
     @patch('chat_messages.consumers.retrieve_relevant_memories', return_value=[])
@@ -1197,6 +1240,46 @@ class ConversationConsumerTest(TransactionTestCase):
     @patch("chat_messages.services.extract_memories_task")
     @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
     @patch("chat_messages.services.send_chat_message")
+    def test_starting_a_turn_cleans_up_an_orphaned_pending_turn_from_a_prior_crash(
+        self, mock_send, mock_memories, mock_extract_task, mock_title_task,
+    ):
+        # Regression test: a PendingTurn row left over from an earlier crash
+        # that nobody has reconnected to clean up yet (_join_thread only
+        # deletes one row per join, by pk) must not accumulate forever.
+        # try_claim already guarantees no other WS turn is concurrently in
+        # flight when a new one starts, and the HTTP path never creates rows
+        # at all -- so any row found here can only be such an orphan.
+        orphaned = PendingTurn.objects.create(thread=self.existing_thread, user_text="From a crashed turn")
+
+        async def fake_chunks():
+            yield "Hi there!"
+
+        async def fake_send_chat_message(*args, **kwargs):
+            return fake_chunks(), None, False
+
+        mock_send.side_effect = fake_send_chat_message
+
+        async def scenario():
+            communicator = WebsocketCommunicator(ConversationConsumer.as_asgi(), "/ws/conversations/")
+            communicator.scope["user"] = self.user
+            connected, _ = await communicator.connect()
+            assert connected
+
+            await communicator.send_json_to({"thread_id": self.existing_thread.id, "message": "Hi"})
+            await communicator.receive_json_from()  # thinking
+            await communicator.receive_json_from()  # chunk
+            await communicator.receive_json_from()  # done
+
+            await communicator.disconnect()
+
+        run(scenario())
+        self.assertFalse(PendingTurn.objects.filter(pk=orphaned.pk).exists())
+        self.assertEqual(PendingTurn.objects.filter(thread=self.existing_thread).count(), 0)
+
+    @patch("chat_messages.services.generate_thread_title_task")
+    @patch("chat_messages.services.extract_memories_task")
+    @patch("chat_messages.consumers.retrieve_relevant_memories", return_value=[])
+    @patch("chat_messages.services.send_chat_message")
     def test_pending_turn_row_spans_the_whole_turn_not_just_confirmation(
         self, mock_send, mock_memories, mock_extract_task, mock_title_task,
     ):
@@ -1576,6 +1659,36 @@ class ConversationConsumerTest(TransactionTestCase):
         consumer.send.assert_awaited_once()
         sent = json.loads(consumer.send.call_args.args[0])
         self.assertIn("Something went wrong", sent["error"])
+
+    def test_run_turn_task_releases_claim_on_cancellation_during_setup(self):
+        # Regression test: asyncio.CancelledError is BaseException, not
+        # Exception, since Python 3.8 -- the plain `except Exception:` below
+        # doesn't catch it. _stop_generation cancels exactly the task
+        # attach_task registers as this method's very first line, so a stop
+        # arriving during group_add/memory-retrieval/the "thinking" status
+        # (before run_and_broadcast_turn's own CancelledError handling even
+        # starts) used to propagate uncaught, leaking the claim forever with
+        # no chat.done ever reaching the client -- the same permanent-hang
+        # failure mode as an uncaught plain exception, just for a Cancelled
+        # one instead.
+        consumer = ConversationConsumer()
+        consumer.scope = {"user": self.user}
+        consumer.channel_layer = AsyncMock()
+        consumer.channel_layer.group_add.side_effect = asyncio.CancelledError()
+        consumer.channel_name = "test-channel-x"
+        consumer._joined_groups = set()
+        consumer.send = AsyncMock()
+
+        generation_registry.try_claim(self.existing_thread.id)
+
+        run(consumer._run_turn_task(self.existing_thread, "Hi", self.user, f"thread_{self.existing_thread.id}"))
+
+        self.assertFalse(generation_registry.is_active(self.existing_thread.id))
+        consumer.channel_layer.group_send.assert_awaited_once_with(
+            f"thread_{self.existing_thread.id}",
+            {"type": "chat.done", "thread_id": self.existing_thread.id, "stopped": True},
+        )
+        consumer.send.assert_not_awaited()
 
 
 class SendMessageAPICreditsTest(APITestCase):

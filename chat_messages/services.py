@@ -35,15 +35,33 @@ def _record_turn(
     cost_usd = Decimal("0")
     if not used_global_key:
         cost_usd = Decimal(str(round(compute_turn_cost_usd(thread.ai_provider, thread.model, usage), 6)))
-    Message.objects.bulk_create([
-        Message(thread=thread, sender="user", content=user_text),
-        Message(
-            thread=thread, sender="assistant", content=assistant_text, tool_calls=tool_calls or [],
-            input_tokens=usage.input_tokens if usage else 0,
-            output_tokens=usage.output_tokens if usage else 0,
-            estimated_cost_usd=cost_usd,
-        ),
-    ])
+    # Message creation and the PendingTurn delete below are in the same
+    # atomic block, deliberately -- a hard kill (OOM, infra-level restart,
+    # not a catchable Python exception) landing between two separate
+    # statements here would leave the row alive despite the turn's content
+    # already being durably saved, just like the previously-later await
+    # this feature already closed one such gap for (see the PendingTurn
+    # docstring). Wrapping both in one commit closes it down to "a DB commit
+    # is atomic", the practical floor for this without a distributed
+    # transaction spanning Celery too.
+    with transaction.atomic():
+        Message.objects.bulk_create([
+            Message(thread=thread, sender="user", content=user_text),
+            Message(
+                thread=thread, sender="assistant", content=assistant_text, tool_calls=tool_calls or [],
+                input_tokens=usage.input_tokens if usage else 0,
+                output_tokens=usage.output_tokens if usage else 0,
+                estimated_cost_usd=cost_usd,
+            ),
+        ])
+        # pending_turn_id is None for send_message's HTTP path (which never
+        # creates a PendingTurn row at all -- no generation_registry claim
+        # guards it, so there's nothing of its own to clean up here).
+        # Deleting by pk rather than by thread_id matters even on the WS
+        # path: a concurrent HTTP send on the same thread must never be able
+        # to delete a still-in-flight WS turn's own row out from under it.
+        if pending_turn_id is not None:
+            PendingTurn.objects.filter(pk=pending_turn_id).delete()
     is_first_turn = not history
     with transaction.atomic():
         locked_thread = Thread.objects.select_for_update().get(pk=thread.pk)
@@ -72,27 +90,6 @@ def _record_turn(
         thread.title = locked_thread.title
         generate_thread_title_task.delay(thread.id, user_text[:500], assistant_text[:500])
     extract_memories_task.delay(thread.user_id, thread.assistant_id, user_text, assistant_text)
-    # Deleted here (by its own pk, not by thread_id), not left to
-    # run_and_broadcast_turn's outer `finally`, so there's no await between
-    # "Messages persisted" and "PendingTurn gone" -- the outer finally's own
-    # deletion still runs afterward as a no-op, and stays the only cleanup
-    # for paths that never reach this function at all (InsufficientCreditsError,
-    # a bare Exception). Closes a real gap: PendingTurn.__doc__ claims
-    # "nothing is written to Message until the whole turn completes", but a
-    # crash during the previously-later await _deduct_credits_after_persisted_turn
-    # (after this function returns) left the row alive despite the turn's
-    # content already being safely saved -- harmless before this feature
-    # (just an unneeded "please resend"), actively dangerous once a stale
-    # row can trigger an automatic replay (see ConversationConsumer._join_thread).
-    #
-    # pending_turn_id is None for send_message's HTTP path (which never
-    # creates a PendingTurn row at all -- no generation_registry claim
-    # guards it, so there's nothing of its own to clean up here). Deleting
-    # by pk rather than by thread_id matters even on the WS path: a
-    # concurrent HTTP send on the same thread must never be able to delete
-    # a still-in-flight WS turn's own row out from under it.
-    if pending_turn_id is not None:
-        PendingTurn.objects.filter(pk=pending_turn_id).delete()
 
 
 def get_usage_summary(user) -> dict:
@@ -174,6 +171,15 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
     # send_message/_record_turn) must never be able to touch a WS turn's
     # own row, and generation_registry.try_claim already guarantees at
     # most one WS turn per thread anyway, so pk is never less precise.
+    #
+    # Any PendingTurn already on this thread at this exact point cannot be
+    # legitimate: try_claim (called by our own caller just before this)
+    # already guarantees no other WS turn is concurrently in flight on it,
+    # and the HTTP path never creates rows at all -- so a pre-existing one
+    # here can only be an orphan from an earlier crash that nobody has
+    # reconnected to clean up yet (_join_thread only ever deletes one row
+    # per join, by pk). Left alone, it would linger in the DB forever.
+    await sync_to_async(PendingTurn.objects.filter(thread_id=thread.id).delete)()
     pending_turn = await sync_to_async(PendingTurn.objects.create)(thread=thread, user_text=text)
     history = thread.conversation_state or []
     tool_calls: list[str] = []
@@ -184,33 +190,25 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         # row carries this turn's safety signal for ConversationConsumer
         # ._join_thread's auto-replay decision -- on_tool_call fires before
         # a tool's confirmation gate (see AgentTool's docstring), so any
-        # entry here, confirmed or not, must disqualify auto-replay.
-        # Independent of the client-facing broadcast below (one talks to
-        # Postgres, the other to the channel layer) -- run concurrently
-        # rather than paying two round-trips back to back on a path that's
-        # already latency-sensitive for perceived responsiveness.
-        # return_exceptions=True: this write is a durability nice-to-have,
-        # not core to the turn -- letting a transient DB blip here propagate
-        # would abort the whole tool-execution loop (on_tool_call is awaited
-        # directly by agent_loop.py) over what should, at worst, degrade to
-        # a slightly-stale PendingTurn.tool_calls, same tolerance the actual
-        # tool executor's own confirmation gate already has for hiccups
-        # elsewhere in this turn.
-        pending_turn_update, broadcast = await asyncio.gather(
-            sync_to_async(PendingTurn.objects.filter(pk=pending_turn.pk).update)(tool_calls=tool_calls),
-            channel_layer.group_send(
+        # entry here, confirmed or not, must disqualify auto-replay. This
+        # write is NOT a nice-to-have: unlike the purely informational
+        # status broadcast below, a silently-swallowed failure here would
+        # leave PendingTurn.tool_calls looking safe (still []) even though
+        # this tool is about to run with a real side effect -- exactly the
+        # unsafe auto-replay this signal exists to prevent. Let it propagate
+        # (aborting the turn, same as any other DB failure mid-turn) rather
+        # than degrade silently.
+        await sync_to_async(PendingTurn.objects.filter(pk=pending_turn.pk).update)(tool_calls=tool_calls)
+        try:
+            await channel_layer.group_send(
                 group_name, {"type": "chat.status", "status": "tool_call", "tool": tool_name, "thread_id": thread.id},
-            ),
-            return_exceptions=True,
-        )
-        if isinstance(pending_turn_update, Exception):
-            logger.exception(
-                "Failed to persist tool_calls onto PendingTurn for thread %s", thread.id, exc_info=pending_turn_update,
             )
-        if isinstance(broadcast, Exception):
-            logger.exception(
-                "Failed to broadcast tool_call status for thread %s", thread.id, exc_info=broadcast,
-            )
+        except Exception:
+            # Purely informational plumbing -- a client that misses this
+            # "using tool X" status frame still gets the tool's actual
+            # result normally; not worth aborting an otherwise-succeeding
+            # turn over, unlike the PendingTurn write above.
+            logger.exception("Failed to broadcast tool_call status for thread %s", thread.id)
 
     async def track_delegate_start(provider_label):
         # The delegated call (a fresh, one-shot send_chat_message) used to
