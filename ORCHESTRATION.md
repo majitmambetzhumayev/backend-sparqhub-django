@@ -91,16 +91,23 @@ needs to know whether it delegated to a single agent or an entire team.
   (a compiled graph embeddable as a single node in a parent graph) more
   closely than the earlier flat-delegation framing did. Worth
   re-evaluating once this is actually being built, not before.
-- **Durable resume is still only partial.** `PendingTurn` (see `REVIEW.md`'s
-  MCP integration section) now covers a crash anywhere in a turn's
-  lifetime — mid-stream, mid-tool-call, mid-confirmation-wait — with a
-  "please resend" signal, generalized from an earlier version that only
-  covered the confirmation-wait window. It still doesn't *resume* the
-  turn, only reports the interruption. Orchestration adds more ways a turn
-  can be mid-flight (waiting on a nested pod, say) — `PendingTurn` should
-  already cover those too (it's turn-level, not tied to any specific
-  sub-state), but confirm that holds once pods actually exist rather than
-  assuming it.
+- **Durable resume is still only partial, but no longer always manual.**
+  `PendingTurn` (see `REVIEW.md`'s MCP integration section) covers a crash
+  anywhere in a turn's lifetime — mid-stream, mid-tool-call,
+  mid-confirmation-wait. As of 2026-09-24, when nothing was ever proposed
+  this turn (`PendingTurn.tool_calls` empty), `ConversationConsumer
+  ._join_thread` auto-replays the whole turn on reconnect instead of just
+  telling the client to resend — still not *exact-point* resume (a fresh
+  `run_and_broadcast_turn`, not a continuation), and `delegate_to_agent`
+  composes with this correctly with no special-casing: calling it is
+  tracked as an ordinary tool call (`on_tool_call` fires the same way for
+  every `AgentTool`), so any turn that invoked it falls back to the
+  conservative "please check, then resend" path rather than risking an
+  auto-replay on top of a delegation that may have already run. Orchestration
+  adds more ways a turn can be mid-flight (waiting on a nested pod, say) —
+  `PendingTurn` should already cover those too (it's turn-level, not tied
+  to any specific sub-state), but confirm that holds once pods actually
+  exist rather than assuming it.
   ✅ Confirmed for `delegate_to_agent`: its executor runs synchronously
   within the outer turn's own async call stack (same task the top-level
   `PendingTurn` row already spans), no new DB row or task is created per

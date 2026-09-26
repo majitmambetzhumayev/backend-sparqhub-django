@@ -41,17 +41,19 @@ class Message(models.Model):
 
 
 class PendingTurn(models.Model):
-    """A durability net around generation_registry's in-memory turn state,
-    NOT a true resume mechanism — see chat_messages/services.py's
-    run_and_broadcast_turn and ORCHESTRATION.md for what a real fix would
-    need (the provider's tool-call response isn't serializable in a
-    provider-agnostic way, and naively replaying a turn risks re-running
-    side effects, e.g. double-charging credits). This model only exists so
-    a process restart at ANY point during an in-flight turn — mid-stream,
-    mid-tool-call, mid-confirmation-wait, anywhere — is surfaced to the
-    client as a clear "please resend" instead of the turn silently
-    vanishing (nothing is written to Message until the whole turn
-    completes, so today there's no trace of it at all).
+    """A durability net around generation_registry's in-memory turn state —
+    still not *exact-point* resume (see chat_messages/services.py's
+    run_and_broadcast_turn and ORCHESTRATION.md: a provider's native
+    tool-call response isn't serializable in a provider-agnostic way, so a
+    crash mid-tool-loop can't be picked back up exactly where it left off),
+    but as of ConversationConsumer._join_thread's auto-replay path, a
+    process restart mid-turn is no longer always a dead end: when nothing
+    could have had a side effect yet (see `tool_calls` below), the whole
+    turn is safely replayed automatically on reconnect rather than just
+    telling the client to resend it. When a tool call *was* proposed,
+    it's still surfaced as a clear "please check, then resend" instead of
+    silently vanishing (nothing is written to Message until the whole turn
+    completes, so today there's no other trace of it at all).
 
     Started as a narrower model (PendingToolConfirmation) covering only the
     tool-confirmation-wait window; generalized to span the whole turn once
@@ -60,14 +62,28 @@ class PendingTurn(models.Model):
     whatsoever, not even the "interrupted" message this model exists to
     provide.
 
-    Written at the very start of run_and_broadcast_turn, deleted in its
-    `finally` regardless of how the turn ends (completed, stopped,
-    errored, insufficient credits) — at most one row per thread at any
-    instant, by construction (generation_registry.try_claim already
-    prevents two concurrent turns on the same thread)."""
+    Written at the very start of run_and_broadcast_turn, deleted as soon as
+    _record_turn persists the turn's Message rows (not left to the later
+    `finally`, which would leave a gap between "saved" and "row gone" wide
+    enough for a crash in that window to trigger a duplicate auto-replay —
+    see _record_turn) or, for every other outcome (stopped, errored,
+    insufficient credits), in that `finally` as the catch-all. At most one
+    row per thread at any instant, by construction
+    (generation_registry.try_claim already prevents two concurrent turns on
+    the same thread)."""
     thread = models.ForeignKey(Thread, on_delete=models.CASCADE, related_name='pending_turns')
     user_text = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
+    # Ordered tool names proposed so far this turn (kept in sync with
+    # run_and_broadcast_turn's local tool_calls list via track_tool_call).
+    # An empty list is the safety signal a reconnecting client's stale row
+    # is auto-replayed on: on_tool_call fires *before* a tool's confirmation
+    # gate (see AgentTool's docstring), so this can't distinguish "actually
+    # ran" from "merely proposed, maybe declined" -- deliberately
+    # conservative: ANY entry here, confirmed or not, disqualifies
+    # auto-replay, since we can't yet prove nothing ran. See
+    # ConversationConsumer._join_thread.
+    tool_calls = models.JSONField(default=list, blank=True)
 
     def __str__(self):
         return f"PendingTurn on Thread {self.thread_id}"

@@ -121,44 +121,65 @@ scenario not covered by the current fix.
   on one, no longer means editing dispatch logic. See
   `ai_providers/tests/test_chat_router.py::BuildCombinedExecutorTest` for the
   gate tested generically, independent of any specific tool.
-- ✅ **Interim fix (2026-08-27, generalized 2026-09-09): a restart mid-turn
-  no longer loses it silently, at any point in the turn.**
-  `chat_messages/generation_registry.py` still holds the actual in-flight
-  turn state (an `asyncio.Future` for a confirmation wait, `streamed_text`
-  for a plain stream) purely in-memory, scoped to the single ASGI process —
-  that part is unchanged and a restart still kills it. What's durable:
-  `chat_messages.models.PendingTurn` records that a turn is in flight
-  (thread, user's message) from the moment `run_and_broadcast_turn` starts
-  it until it completes (success, stopped, errored, or insufficient
-  credits — cleared in the same `finally` that already releases
-  `generation_registry`). `_join_thread` (`consumers.py`) checks for a
-  stale row when `generation_registry` shows nothing active, and tells a
-  reconnecting client their turn was interrupted instead of leaving them
-  with no signal at all. Originally shipped narrower (as
-  `PendingToolConfirmation`, only spanning the tool-confirmation-wait
-  window) — generalized once it was clear a crash during *plain
-  streaming*, no tool call involved, left nothing behind whatsoever, not
-  even an error. Unit tested:
+- ✅ **A restart mid-turn no longer loses it silently, at any point in the
+  turn — and, as of 2026-09-24, often no longer needs a manual resend
+  either.** `chat_messages/generation_registry.py` still holds the actual
+  in-flight turn state (an `asyncio.Future` for a confirmation wait,
+  `streamed_text` for a plain stream) purely in-memory, scoped to the
+  single ASGI process — that part is unchanged and a restart still kills
+  it. What's durable: `chat_messages.models.PendingTurn` records that a
+  turn is in flight (thread, user's message, and which tool names have
+  been proposed so far) from the moment `run_and_broadcast_turn` starts it
+  until it completes. Deleted as soon as `_record_turn` persists the
+  turn's `Message` rows (not left to the later `finally`, which used to
+  leave a gap wide enough for a crash there to strand the row alongside
+  already-saved content); the outer `finally` stays the catch-all for
+  every other outcome (stopped, errored, insufficient credits).
+  `_join_thread` (`consumers.py`) checks for a stale row when
+  `generation_registry` shows nothing active, and branches on whether any
+  tool was ever proposed that turn:
+  - **No tool proposed** (nothing could have had a side effect) — replays
+    the whole turn automatically: a fresh `run_and_broadcast_turn` call
+    using the persisted `user_text`, spawned via a new shared
+    `_run_turn_task` (extracted from `_start_generation`'s tail so both
+    call sites share the exact same registration/error-handling path). The
+    reconnecting client sees the existing `"resuming"` frame shape
+    (`user_text`/`streamed_text`) it already knew how to render — no
+    frontend changes needed.
+  - **A tool was proposed** (confirmed, declined, or still pending —
+    `on_tool_call` fires *before* the confirmation gate, so these can't be
+    told apart) — conservatively falls back to a "please check, then
+    resend" message rather than risk replaying something that may already
+    have run.
+
+  Originally shipped narrower (as `PendingToolConfirmation`, only spanning
+  the tool-confirmation-wait window) — generalized once it was clear a
+  crash during *plain streaming*, no tool call involved, left nothing
+  behind whatsoever, not even an error. Unit tested:
   `chat_messages/tests.py::test_pending_turn_row_spans_the_whole_turn_not_just_confirmation`,
-  `test_join_thread_reports_interrupted_turn_after_restart`,
+  `test_record_turn_deletes_pending_turn_immediately`,
+  `test_tool_call_is_mirrored_onto_pending_turn_row`,
+  `test_join_thread_auto_replays_interrupted_turn_with_no_tool_calls`,
+  `test_join_thread_reports_interrupted_turn_with_a_tool_call_after_restart`,
   `test_join_thread_with_no_pending_turn_sends_nothing`.
-- ⚠️ **Deliberately NOT a fix for the underlying gap** — this does not
-  resume the paused turn, only reports that it was interrupted. A true
-  fix needs to rebuild the paused state and continue (à la LangGraph's
-  `interrupt()`/checkpointer), which is bigger and was explicitly deferred:
-  the provider's tool-call response isn't serializable in a
-  provider-agnostic way, and naively replaying it risks re-running side
-  effects (e.g. double-charging credits — see the idempotency note from the
-  LangGraph `interrupt()` discussion in the memory notes). When that real
-  fix lands, it should replace `PendingTurn`, not extend it.
-- **Direction, not yet started: multi-agent orchestration.** Today the only
-  "agentic" mechanism beyond a single assistant's tool loop is
-  `delegate_to_model` (a manual, one-shot escalation). The `AgentTool`
-  registry above and the pending-confirmation persistence work are both
-  useful regardless, but whether to adopt LangGraph for actual
-  orchestration (vs. continuing to hand-roll it) is an explicit, deferred
-  decision — not to be assumed either way without revisiting once
-  multi-agent work has a concrete shape.
+- ⚠️ **Still not exact-point resume.** A crash mid-tool-loop (after a tool
+  was proposed) still can't be picked back up exactly where it left off —
+  a provider's native tool-call response isn't serializable in a
+  provider-agnostic way, so rebuilding that mid-loop state (à la
+  LangGraph's `interrupt()`/checkpointer) stays a bigger, explicitly
+  deferred undertaking. What shipped instead is a safe *whole-turn* replay
+  for the case where nothing could have gone wrong yet, not a general
+  fix — the tool-proposed case is intentionally left exactly as
+  conservative as before. This is a deliberate, narrow exception to the
+  earlier "don't extend `PendingTurn`, replace it" guardrail (`CLAUDE.md`
+  explains the distinction) — not a quiet reversal of it: the constraint
+  was about not building exact-point resume piecemeal, and whole-turn
+  replay gated on one conservative boolean doesn't do that.
+- ✅ **Multi-agent orchestration has started** — see the dedicated section
+  below (`delegate_to_agent`). `delegate_to_model` (a manual, one-shot
+  provider escalation) was the only "agentic" mechanism before that.
+  Whether to adopt LangGraph for orchestration (vs. continuing to
+  hand-roll it) is still an explicit, deferred decision.
 
 ## Image generation (`generate_image` tool)
 

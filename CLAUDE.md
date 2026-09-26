@@ -74,22 +74,40 @@ read-only/low-risk.
 Any in-flight turn (`chat_messages/generation_registry.py`'s state, plus the
 `asyncio.Future` a confirmation-wait blocks on) is plain in-memory, scoped
 to the single ASGI process — a restart at any point loses it.
-**`chat_messages.models.PendingTurn` is an interim fix for this, not the
-real one**: it durably records that a turn is in flight (thread, the
-user's message) from the moment it starts until it completes, so a
-reconnecting client after a restart — whenever in the turn the crash
-happened, mid-stream or mid-tool-confirmation-wait — gets a clear "please
-resend" instead of the turn silently vanishing (`_join_thread` in
-`consumers.py`). It does **not** resume the actual paused turn — the
-provider's tool-call response isn't serializable in a provider-agnostic
-way, and naively replaying it risks re-running side effects (e.g.
-double-charging credits). A true fix (rebuild the paused state and
-continue, à la LangGraph's `interrupt()`/checkpointer) is bigger,
-deliberately deferred, and should replace this model rather than sit
-alongside it once built — don't treat `PendingTurn` as a design to extend.
+**`chat_messages.models.PendingTurn` durably records that a turn is in
+flight** (thread, the user's message, and — as of 2026-09-24 — which tool
+names were proposed so far) from the moment it starts until it completes,
+so a reconnecting client after a restart isn't left with the turn silently
+vanishing (`_join_thread` in `consumers.py`). It still does **not** resume
+the actual paused turn mid-tool-loop — the provider's tool-call response
+isn't serializable in a provider-agnostic way, so exact-point resume (à la
+LangGraph's `interrupt()`/checkpointer) is bigger and stays deliberately
+deferred. What it does instead, safely: when `tool_calls` is empty (nothing
+was ever proposed this turn, so nothing could have had a side effect),
+`_join_thread` replays the *whole turn* automatically on reconnect — a
+fresh `run_and_broadcast_turn` call using the persisted `user_text`, not a
+continuation of the crashed one. When a tool call was proposed (confirmed,
+declined, or still pending — `on_tool_call` fires before the confirmation
+gate, so these can't be told apart), it still falls back to a "please
+check, then resend" message rather than risk replaying something that may
+have already run. `PendingTurn` is deleted as soon as `_record_turn`
+persists the turn's `Message` rows, not left to the later `finally` — that
+gap used to just cause an unneeded "please resend"; now, left open, it
+could trigger a spurious auto-replay on top of an already-completed turn.
 (Originally shipped as a narrower model, `PendingToolConfirmation`, that
 only covered the tool-confirmation-wait window — generalized once it was
 clear a crash during plain streaming left no signal at all.)
+
+**This is a deliberate, narrow exception to "don't treat `PendingTurn` as a
+design to extend,"** not a quiet reversal of it — the constraint that
+mattered was never touching this model, it was not building *exact-point*
+resume piecemeal on top of it (still true: no mid-tool-loop state is
+reconstructed here). Whole-turn replay, gated on a single conservative
+boolean signal, doesn't grow toward that in the way the original rule was
+guarding against. If a future change starts reconstructing partial
+tool-loop state on `PendingTurn` rather than just deciding "replay from
+scratch or don't," that's the real fix arriving piecemeal — stop and build
+the checkpointer instead.
 
 Multi-agent orchestration is a real direction for this product, but
 whether that eventually justifies adopting something like LangGraph is an
