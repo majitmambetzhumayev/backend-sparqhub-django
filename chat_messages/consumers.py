@@ -422,7 +422,19 @@ class ConversationConsumer(AsyncWebsocketConsumer):
         run_and_broadcast_turn itself — simpler, and just as
         uncancellable-by-disconnect as two would be (nothing cancels
         either), and it's what a future cancel/"stop generation" feature
-        would target."""
+        would target.
+
+        CAUTION if adding anything to this method: everything from
+        attach_task down to (but not including) run_and_broadcast_turn's own
+        call must stay inside the try below, including any new setup steps
+        — attach_task is what makes this task cancellable via
+        _stop_generation, and both except branches below only fire for
+        exceptions raised inside this try. Code placed before/outside it
+        gets no cleanup at all on failure: this exact mistake (setup running
+        before the try existed) caused two separate claim-leak bugs in
+        2026-09, one per caller of this method. Also remember
+        asyncio.CancelledError is BaseException, not Exception, since
+        Python 3.8 — a plain `except Exception:` silently lets it through."""
         try:
             generation_registry.attach_task(thread.id, asyncio.current_task())
             generation_registry.set_turn_text(thread.id, message_text)

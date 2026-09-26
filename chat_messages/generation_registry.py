@@ -11,6 +11,16 @@ scaled to multiple workers/instances, this registry stops being
 authoritative across them (group broadcast would still work fine, being
 Redis-backed via channels_redis — only the claim/lock semantics here would
 need to move to Redis too). Not building that now.
+
+CAUTION before touching any caller of try_claim/attach_task/release: the
+key used for release MUST always be the id actually passed to try_claim,
+never a caller parameter that might still be None (e.g. a not-yet-assigned
+thread_id for a brand-new thread) or a value computed differently in a
+different except branch. A 2026-09 refactor of consumers.py (extracting
+_run_turn_task) reintroduced exactly this bug twice by dropping a variable
+that existed only to track "which id did we actually claim" — grep this
+file's callers for `release(` and check each one resolves to the same id
+`try_claim(` was given in that same code path before changing either.
 """
 import asyncio
 from dataclasses import dataclass

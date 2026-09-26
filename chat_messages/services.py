@@ -28,6 +28,18 @@ def _record_turn(
     thread, history, user_text, assistant_text, tool_calls=None, usage=None, used_global_key=True,
     pending_turn_id=None,
 ):
+    # CAUTION: any future PendingTurn read/update/delete anywhere in this
+    # file or consumers.py must be scoped by pk, never by thread_id alone --
+    # generation_registry.try_claim only guarantees one *legitimate* WS turn
+    # per thread, not one *row* (a crash can leave an orphan, and the HTTP
+    # send_message path below shares no locking with the WS path at all). A
+    # thread_id-scoped delete/update can silently touch a different turn's
+    # own row. This bit twice in 2026-09 review (once in this function, once
+    # in consumers.py's _join_thread) before being scoped correctly
+    # everywhere -- if you add a new PendingTurn query, grep for
+    # `PendingTurn.objects` first and match the pk-scoping pattern already
+    # used by every other one.
+    #
     # BYOK spend isn't deducted from credits at all (see the used_global_key
     # gate in send_message/run_and_broadcast_turn below), so it's the one
     # case where this turn's real USD cost needs computing here instead of
@@ -198,6 +210,13 @@ async def run_and_broadcast_turn(thread, text, user, group_name, memories=None):
         # unsafe auto-replay this signal exists to prevent. Let it propagate
         # (aborting the turn, same as any other DB failure mid-turn) rather
         # than degrade silently.
+        #
+        # CAUTION if you're tempted to asyncio.gather this with the
+        # group_send below "since they're independent" (this was actually
+        # done, then reverted, in 2026-09 review): they are NOT equally safe
+        # to fail. Before bundling any two awaits with return_exceptions=True
+        # or similar, ask whether either one is load-bearing for correctness
+        # (this write is) rather than just "can these run concurrently".
         await sync_to_async(PendingTurn.objects.filter(pk=pending_turn.pk).update)(tool_calls=tool_calls)
         try:
             await channel_layer.group_send(
