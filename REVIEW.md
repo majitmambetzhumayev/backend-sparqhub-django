@@ -130,11 +130,16 @@ scenario not covered by the current fix.
   it. What's durable: `chat_messages.models.PendingTurn` records that a
   turn is in flight (thread, user's message, and which tool names have
   been proposed so far) from the moment `run_and_broadcast_turn` starts it
-  until it completes. Deleted as soon as `_record_turn` persists the
-  turn's `Message` rows (not left to the later `finally`, which used to
-  leave a gap wide enough for a crash there to strand the row alongside
-  already-saved content); the outer `finally` stays the catch-all for
-  every other outcome (stopped, errored, insufficient credits).
+  until it completes. `_record_turn` deletes its row in the same atomic
+  transaction as the `Message` rows it persists (not left to a separate,
+  later statement, which used to leave a real async gap wide enough for a
+  crash there to strand the row alongside already-saved content) — this
+  covers both outcomes that reach `_record_turn`: a normal completion, and
+  a stop-with-partial-output (`asyncio.CancelledError` with `collected`
+  non-empty is treated identically to a completion, not left to the outer
+  `finally`). The outer `finally` is the catch-all only for outcomes that
+  never reach `_record_turn` at all: `InsufficientCreditsError`, a bare
+  `Exception`, and a stop with nothing yet collected.
   `_join_thread` (`consumers.py`) checks for a stale row when
   `generation_registry` shows nothing active, and branches on whether any
   tool was ever proposed that turn:

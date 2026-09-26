@@ -1448,7 +1448,20 @@ class ConversationConsumerTest(TransactionTestCase):
         # thread" -- otherwise it can wipe a different, concurrently-created
         # turn's own durability row. Same reasoning as _record_turn's
         # pk-scoped deletes (see its own regression test).
-        stale = PendingTurn.objects.create(thread=self.existing_thread, user_text="Hi")
+        #
+        # Gives `stale` a non-empty tool_calls so _join_thread takes the
+        # "unsafe, don't auto-replay" branch: it deletes and returns
+        # immediately, with no task spawned and no risk of a real network
+        # call to a live AI provider (unlike the empty-tool_calls case,
+        # which is exercised with proper mocks by the auto-replay tests
+        # above) -- this isolates _join_thread's own delete statement from
+        # run_and_broadcast_turn's separate orphan cleanup (see
+        # test_starting_a_turn_cleans_up_an_orphaned_pending_turn_from_a_prior_crash),
+        # which would otherwise also remove concurrent_turn once the
+        # replayed turn starts, for unrelated (and still correct) reasons.
+        stale = PendingTurn.objects.create(
+            thread=self.existing_thread, user_text="Hi", tool_calls=["delegate_to_model"],
+        )
         concurrent_turn = PendingTurn.objects.create(thread=self.existing_thread, user_text="A different turn")
 
         async def scenario():

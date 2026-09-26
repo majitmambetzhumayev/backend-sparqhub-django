@@ -90,10 +90,17 @@ continuation of the crashed one. When a tool call was proposed (confirmed,
 declined, or still pending — `on_tool_call` fires before the confirmation
 gate, so these can't be told apart), it still falls back to a "please
 check, then resend" message rather than risk replaying something that may
-have already run. `PendingTurn` is deleted as soon as `_record_turn`
-persists the turn's `Message` rows, not left to the later `finally` — that
-gap used to just cause an unneeded "please resend"; now, left open, it
-could trigger a spurious auto-replay on top of an already-completed turn.
+have already run. `_record_turn` deletes its `PendingTurn` row in the same
+atomic transaction as the `Message` rows it persists, not left to the later
+`finally` — closes the window down to "a DB commit is atomic" rather than
+leaving an async gap open (a real one existed here: a separate, later
+`await` used to sit between the two, and a crash landing in it left the row
+alive despite the turn's content already being safely saved). Not a
+mathematical zero — a hard kill *during* that commit, or one landing inside
+the unrelated `conversation_state` rebuild/Celery dispatches that still run
+after it, is still a gap in principle, just not one narrower than this
+without a distributed transaction spanning Celery too. Left open, any of
+this would risk a spurious auto-replay on top of an already-completed turn.
 (Originally shipped as a narrower model, `PendingToolConfirmation`, that
 only covered the tool-confirmation-wait window — generalized once it was
 clear a crash during plain streaming left no signal at all.)
